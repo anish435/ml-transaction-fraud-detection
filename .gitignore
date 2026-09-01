@@ -1,0 +1,10 @@
+data/
+venv/
+.kaggle/
+models/
+__pycache__/
+*.zip
+.ipynb_checkpoints/
+*.parquet
+*.csv
+

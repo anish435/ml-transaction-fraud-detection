@@ -77,10 +77,14 @@ def main():
     output_df = raw_df.copy()
     output_df["fraud_probability"] = np.round(probs, 4)
     output_df["is_fraud_predicted"] = preds
-    output_df["risk_decision"] = np.where(preds == 1, "FLAGGED", "APPROVED")
+
+    # Map to 3-Tiered Operational Action Zones
+    conditions = [probs < 0.03, (probs >= 0.03) & (probs < 0.30), probs >= 0.30]
+    actions = ["ALLOW", "CHALLENGE", "HARD_BLOCK"]
+    output_df["operational_action"] = np.select(conditions, actions, default="ALLOW")
 
     # Reorder key columns to front if present
-    front_cols = ["TransactionID", "TransactionDT", "TransactionAmt", "fraud_probability", "is_fraud_predicted", "risk_decision"]
+    front_cols = ["TransactionID", "TransactionDT", "TransactionAmt", "fraud_probability", "operational_action", "is_fraud_predicted"]
     ordered_cols = [c for c in front_cols if c in output_df.columns] + [c for c in output_df.columns if c not in front_cols]
     output_df = output_df[ordered_cols]
 

@@ -89,22 +89,20 @@ def display_result(prob, amount, mean_val):
     print(f" Transaction Amount : ${amount:.2f}")
     print(f" Card Historical Avg: ${mean_val:.2f}")
     print(f" Fraud Probability  : {risk_pct:.2f}%")
-    print(f" Decision Threshold : {THRESHOLD * 100:.0f}%")
     print("-" * 55)
 
-    if prob >= THRESHOLD:
-        print(" [!] STATUS: REJECTED / FLAGGED FOR MANUAL REVIEW")
-        print(" [!] RISK LEVEL: HIGH RISK DETECTED")
-        if risk_pct > 70:
-            print(" [?] REASON: High probability signature matching known fraud patterns.")
-        elif amount > mean_val * 3:
-            print(f" [?] REASON: Transaction amount (${amount:.2f}) is unusually high vs card average (${mean_val:.2f}).")
-        else:
-            print(" [?] REASON: High-risk transaction parameters (time/location/product anomalies).")
+    if prob < 0.03:
+        print(" [*] OPERATIONAL ACTION: ALLOW")
+        print(" [*] RISK LEVEL        : LOW RISK")
+        print(" [*] REASON            : Smooth checkout path. Zero user friction.")
+    elif prob < 0.30:
+        print(" [!] OPERATIONAL ACTION: CHALLENGE / STEP-UP 2FA")
+        print(" [!] RISK LEVEL        : MEDIUM RISK")
+        print(" [!] REASON            : Trigger 2FA / OTP check to verify cardholder identity.")
     else:
-        print(" [*] STATUS: APPROVED")
-        print(" [*] RISK LEVEL: LOW RISK (LEGITIMATE TRANSACTION)")
-        print(" [*] REASON: Transaction parameters align with normal purchasing behavior.")
+        print(" [X] OPERATIONAL ACTION: HARD BLOCK")
+        print(" [X] RISK LEVEL        : HIGH RISK DETECTED")
+        print(" [X] REASON            : High-confidence fraud signature. Instantly rejected.")
 
     print("=" * 55 + "\n")
 

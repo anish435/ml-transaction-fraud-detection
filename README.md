@@ -1,18 +1,21 @@
-# Credit Card Fraud Detection Pipeline — IEEE-CIS Benchmark
+# Credit Card Fraud Detection Pipeline — Production Payment Gateway Engine
 
-An end-to-end, production-ready machine learning framework for detecting credit card transaction fraud on the [IEEE-CIS Fraud Detection](https://www.kaggle.com/competitions/ieee-fraud-detection) benchmark (~590K transactions, 27.6:1 class imbalance). 
+An end-to-end, enterprise-grade machine learning system designed to detect credit card transaction fraud on the [IEEE-CIS Fraud Detection](https://www.kaggle.com/competitions/ieee-fraud-detection) benchmark (~590K transactions, 27.6:1 class imbalance). 
 
-This project incorporates **leakage-safe feature engineering**, **past-only rolling velocity & counterparty domain diversity signals**, **isotonic probability calibration**, **ensemble model stacking**, **walk-forward temporal validation**, and **cost-minimizing threshold optimization**.
+This engine features **leakage-safe pre-split rolling velocity**, **email domain counterparty diversity**, **isotonic probability calibration**, **ensemble model stacking**, **walk-forward validation**, a **dynamic value-based financial cost model**, **three-tiered operational risk routing (`ALLOW`, `CHALLENGE`, `HARD_BLOCK`)**, and **human-readable SHAP operational alerts**.
 
 ---
 
-## 🚀 Key Highlights & Headline Results
+## 🚀 Key Highlights & Headline Metrics
 
 * **Sealed Test PR-AUC**: **`0.5116`** (Stacked Blend) / **`0.5100`** (Calibrated XGBoost) vs ~0.035 no-skill baseline.
 * **Sealed Test ROC-AUC**: **`0.8929`** (XGBoost + Velocity + Counterparty Diversity features).
-* **Probability Calibration**: Isotonic calibration reduced probability Brier Loss from `0.0687` to **`0.0215`** (**-68.7% loss reduction**), cutting false alarms @ 0.30 threshold by **96.2%**.
-* **Cost-Minimizing Threshold**: **`0.03`** (balancing transaction amount $ loss against a $5 false-alarm review penalty), minimizing total loss to **`$134,865.54`** while catching **82.74%** of all fraud.
-* **Production Utilities**: Includes a zero-leakage batch inference script (`score_batch.py`) and an interactive CLI simulator (`predict_transaction.py`).
+* **Probability Calibration**: Isotonic calibration reduced Brier Loss from `0.0687` to **`0.0215`** (**-68.7% loss reduction**), cutting false alarms @ 0.30 threshold by **96.2%**.
+* **Dynamic Cost-Minimizing Threshold**: **`0.07`** (balancing transaction amount $ loss, 3% merchant margin, $10 churn penalty, and $15 chargeback fee), reducing total financial loss to **`$242,451.69`** and boosting Precision to **`29.75%`** (a **67.4% reduction in false alarms**).
+* **Three-Tiered Operational Routing**:
+  * **`ALLOW` (`p < 0.03`)**: Approves **80.58%** of total transactions (**$8.82M GMV / 73.9% of total volume**) with **zero user friction**.
+  * **`CHALLENGE / STEP-UP 2FA` (`0.03 <= p < 0.30`)**: Routes **17.22%** of volume to 2FA / OTP verification, recovering honest user GMV while catching **39.5%** of fraud.
+  * **`HARD_BLOCK` (`p >= 0.30`)**: Instantly rejects high-risk transactions with **`67.38%` Precision**.
 
 ---
 
@@ -23,7 +26,7 @@ The dataset merges transaction logs with identity/device metadata on `Transactio
 * **Total Transactions**: `590,540` rows (182-day time span)
 * **Class Imbalance**: `569,877` Legitimate (96.50%) vs `20,663` Fraudulent (3.50%) $\rightarrow$ **`27.6 : 1`** ratio
 * **Feature Schema**:
-  * `TransactionDT`: Timedelta in seconds (used for chronological sorting & time-window features).
+  * `TransactionDT`: Timedelta in seconds (used for chronological sorting & rolling time-window features).
   * `TransactionAmt`: Transaction amount in USD ($).
   * `card1`–`card6`: Card identity, brand, type (debit/credit), category.
   * `addr1`, `addr2`: Billing region/zip codes.
@@ -35,7 +38,7 @@ The dataset merges transaction logs with identity/device metadata on `Transactio
 
 ---
 
-## 🛠️ System Architecture & Methodology
+## 🛠️ Operational Architecture & Routing Strategy
 
 ```
                    Raw IEEE-CIS Data (590k Rows)
@@ -59,33 +62,34 @@ Train Set (70%)           Val Set (15%)              Test Set (15%)
                                  │
          Isotonic Calibration ──► Ensemble Stacking (Blend)
                                  │
-             Cost-Minimizing Threshold Optimization (t=0.03)
+             Dynamic Cost Optimization (t=0.07) & 3-Tiered Routing
                                  │
-           Production Scoring CLI (score_batch.py)
+      ┌──────────────────────────┼──────────────────────────┐
+      ▼                          ▼                          ▼
+LOW RISK (p < 0.03)      MEDIUM RISK (0.03 <= p < 0.30) HIGH RISK (p >= 0.30)
+  Action: ALLOW             Action: CHALLENGE / 2FA       Action: HARD_BLOCK
+(80.6% Vol / $8.8M GMV)     (17.2% Vol / Step-Up OTP)     (2.2% Vol / 67.4% Prec)
 ```
 
-### 1. Leakage-Safe Chronological Splitting
-Data is sorted strictly by `TransactionDT` into Train (70%), Validation (15%), and Test (15%). The test set remains sealed until final evaluation.
+### 1. Three-Tiered Operational Risk Zones
+To prevent GMV destruction from binary hard-blocking, incoming transactions are dynamically routed:
+* **LOW RISK (`p < 0.03`) $\rightarrow$ `ALLOW`**: Frictionless checkout for 80.58% of volume ($8.82M GMV).
+* **MEDIUM RISK (`0.03 <= p < 0.30`) $\rightarrow$ `CHALLENGE / STEP-UP 2FA`**: Triggers 2FA / OTP check. Honest cardholders complete verification to save GMV, while fraudsters drop off.
+* **HIGH RISK (`p >= 0.30`) $\rightarrow$ `HARD_BLOCK`**: Immediate rejection for severe fraud threats (67.38% Precision).
 
-### 2. Rolling Velocity & Counterparty Diversity Features
-All rolling features are computed on the **FULL chronological stream BEFORE train/val/test splitting** to guarantee continuous historical context across split boundaries:
-* `card_tx_count_1h` & `card_tx_count_24h`: Transaction velocity for `card1` in the previous 1 hour and 24 hours.
-* `card_time_since_last_tx`: Elapsed seconds since `card1`'s previous transaction.
-* `card_distinct_emaildomain_24h`: Count of unique email domains (`P_emaildomain` / `R_emaildomain`) used by `card1` in 24 hours.
-* `card_counterparty_diversity_24h`: $\frac{\text{card\_distinct\_emaildomain\_24h}}{\text{card\_tx\_count\_24h}}$ (domain diversity signal).
+### 2. Dynamic Value-Based Financial Cost Model
+Calculates exact financial loss accounting for transaction amounts, merchant margins, churn penalties, and chargeback fees:
+$$\text{False Positive Cost (FP)} = (\text{TransactionAmt} \times \text{Merchant\_Margin}) + \text{Churn\_Penalty}$$
+$$\text{False Negative Cost (FN)} = \text{TransactionAmt} + \text{Chargeback\_Processor\_Fee}$$
+*(Defaults: `Merchant_Margin = 0.03`, `Churn_Penalty = $10.00`, `Chargeback_Fee = $15.00`)*.
 
-> **Zero Leakage**: Because every rolling calculation for transaction at index $i$ evaluates exclusively past timestamps ($t' \le t_i$), computing over the full stream maintains continuous history with **zero future leakage**.
-
-### 3. Model Suite & Stacking
-* **Logistic Regression**: Preprocessed with `StandardScaler` + `SimpleImputer` and balanced class weights.
-* **PyTorch MLP (`FraudMLP`)**: 3-layer neural network trained with weighted `BCEWithLogitsLoss`.
-* **XGBoost Classifier**: Hyperparameter-tuned tree model (`max_depth=6`, `learning_rate=0.05`, `scale_pos_weight=27.4`).
-* **Isotonic Calibration**: `CalibratedClassifierCV` fitting on `val_set` to align raw confidence scores with true empirical fraud rates.
-* **Stacking Ensemble**: Probability-weighted blend (`0.00` LR + `0.05` MLP + `0.95` Calibrated XGBoost).
+### 3. SHAP Operational Alert Extraction (`explain_transaction_alert`)
+Converts raw float SHAP importance scores into actionable dashboard alerts for risk analysts:
+* *Example Alert Output*: `[!] Extreme 24-Hour Velocity (5 tx in last 24 hours)`, `[!] High Email Domain Diversity (2.50 domain diversity ratio)`, `[!] Unusual Amount for Card Profile (3.45 z-score relative to card mean)`.
 
 ---
 
-## 📈 Model Performance & Benchmarks
+## 📈 Model Performance Benchmarks
 
 ### Sealed Test Set Metrics
 
@@ -97,21 +101,11 @@ All rolling features are computed on the **FULL chronological stream BEFORE trai
 | Calibrated XGBoost + Velocity + Diversity | **0.8929** | **0.5100** |
 | **Stacked Ensemble Blend (Final)** | **0.8884** | **0.5116** |
 
-### Calibrated Decision Threshold Cost Analysis
-
-| Operating Threshold | Precision | Recall (Fraud Caught) | False Positives (FP) | Total Financial Loss ($) |
-| :---: | :---: | :---: | :---: | :---: |
-| `0.01` | 7.85% | 93.16% | 33,257 | $191,128.63 |
-| **`0.03`** *(Optimal)* | **14.63%** | **82.74%** | **14,686** | **$134,865.54** |
-| `0.05` | 21.31% | 73.87% | 8,296 | $158,690.08 |
-| `0.10` | 33.49% | 64.20% | 3,878 | $185,911.55 |
-| `0.30` | 67.38% | 43.20% | 636 | $300,467.75 |
-
 ---
 
-## 🔍 SHAP Explainability Rankings
+## 🔍 SHAP Feature Importance Rankings
 
-Global SHAP analysis highlights the top feature drivers across 431 active features:
+Global SHAP analysis highlights top feature drivers across 431 active features:
 
 | Feature Name | Category | SHAP Rank | Description |
 | :--- | :--- | :---: | :--- |
@@ -141,39 +135,23 @@ ml-transaction-fraud-detection/
 ├── images/                     # Generated Visualizations
 │   └── walk_forward_trend.png  # Walk-forward validation temporal trend
 ├── fraud_detection.py          # Main End-to-End Pipeline Script
-├── score_batch.py              # CLI Batch Inference Script
-├── predict_transaction.py      # Interactive Real-Time Simulator
+├── score_batch.py              # CLI Batch Inference Script (with operational_action)
+├── predict_transaction.py      # Interactive Real-Time Simulator (ALLOW/CHALLENGE/HARD_BLOCK)
 ├── fraud_detection.ipynb       # Project Jupyter Notebook
 ├── README.md                   # Documentation
 └── requirements.txt            # Dependencies
 ```
 
-### Installation
+### Running the Pipeline & Tools
 
 ```bash
-# Clone the repository
-git clone https://github.com/anish435/ml-transaction-fraud-detection.git
-cd ml-transaction-fraud-detection
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### Running the Full Pipeline
-
-```bash
+# Run full pipeline with dynamic cost model & 3-tiered action routing
 python fraud_detection.py
-```
 
-### Scoring New Transactions (Batch Inference CLI)
+# Batch scoring CLI (outputs fraud_probability and operational_action)
+python score_batch.py --input data/new_transactions.csv --output data/scored.csv --threshold 0.07
 
-```bash
-python score_batch.py --input data/new_transactions.csv --output data/scored.csv --threshold 0.03
-```
-
-### Running the Interactive Simulator CLI
-
-```bash
+# Interactive simulator CLI
 python predict_transaction.py
 ```
 

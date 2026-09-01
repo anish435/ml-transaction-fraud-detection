@@ -141,6 +141,120 @@ def generate_synthetic_data(num_rows=2000, seed=42):
 
 
 # ==========================================
+# 1b. Business Logic, Dynamic Cost & Operational Helpers
+# ==========================================
+
+def calculate_dynamic_cost(y_true, y_prob, threshold, amounts, merchant_margin=0.03, churn_penalty=10.0, chargeback_fee=15.0):
+    """Calculate dynamic, transaction-dependent financial loss.
+
+    FP Cost = (TransactionAmt * Merchant_Margin) + Churn_Penalty
+    FN Cost = TransactionAmt + Chargeback_Processor_Fee
+    """
+    preds = (y_prob >= threshold).astype(int)
+    fp_mask = (y_true == 0) & (preds == 1)
+    fn_mask = (y_true == 1) & (preds == 0)
+
+    fp_cost = (amounts[fp_mask] * merchant_margin + churn_penalty).sum()
+    fn_cost = (amounts[fn_mask] + chargeback_fee).sum()
+    return fp_cost + fn_cost
+
+
+def evaluate_three_tiered_action_zones(y_true, y_prob, amounts, p_low=0.03, p_high=0.30):
+    """Evaluate operational performance across 3 risk zones:
+       - LOW RISK (p < p_low): ALLOW
+       - MEDIUM RISK (p_low <= p < p_high): CHALLENGE (Step-Up 2FA/OTP)
+       - HIGH RISK (p >= p_high): HARD_BLOCK
+    """
+    n_total = len(y_true)
+    total_gmv = amounts.sum()
+
+    low_mask = y_prob < p_low
+    med_mask = (y_prob >= p_low) & (y_prob < p_high)
+    high_mask = y_prob >= p_high
+
+    high_fraud = (y_true == 1) & high_mask
+    med_fraud = (y_true == 1) & med_mask
+
+    print("\n" + "=" * 80)
+    print(" 6b. THREE-TIERED OPERATIONAL ACTION ZONES EVALUATION")
+    print("=" * 80)
+    print(f"{'Zone':<15} | {'Probability Range':<18} | {'Action':<12} | {'Volume %':>9} | {'Transactions':>12} | {'GMV ($)':>14}")
+    print("-" * 88)
+
+    for zone_name, prange, action, mask in [
+        ("LOW RISK", f"p < {p_low:.2f}", "ALLOW", low_mask),
+        ("MEDIUM RISK", f"{p_low:.2f} <= p < {p_high:.2f}", "CHALLENGE", med_mask),
+        ("HIGH RISK", f"p >= {p_high:.2f}", "HARD_BLOCK", high_mask),
+    ]:
+        cnt = mask.sum()
+        vol_pct = (cnt / n_total) * 100
+        gmv_zone = amounts[mask].sum()
+        print(f"{zone_name:<15} | {prange:<18} | {action:<12} | {vol_pct:>8.2f}% | {cnt:>12,} | ${gmv_zone:>13,.2f}")
+
+    prec_high = high_fraud.sum() / max(high_mask.sum(), 1)
+    rec_high = high_fraud.sum() / max((y_true == 1).sum(), 1)
+    rec_total_caught = (high_fraud.sum() + med_fraud.sum()) / max((y_true == 1).sum(), 1)
+
+    print("\nOperational Routing Summary:")
+    print(f"  • Hard Block Precision (High Risk Zone):    {prec_high * 100:.2f}%")
+    print(f"  • Hard Block Fraud Recall (High Risk Zone): {rec_high * 100:.2f}%")
+    print(f"  • Total Fraud Identified (Med + High):      {rec_total_caught * 100:.2f}%")
+    print(f"  • Frictionless Approved GMV (Low Risk):     ${amounts[low_mask].sum():,.2f} ({(amounts[low_mask].sum() / total_gmv) * 100:.1f}% of total GMV)")
+
+
+def explain_transaction_alert(input_row, shap_values, feature_names, top_k=3):
+    """Extract top positive SHAP drivers and map to human-readable operational alerts."""
+    label_map = {
+        "card_tx_count_1h": "High 1-Hour Velocity",
+        "card_tx_count_24h": "Extreme 24-Hour Velocity",
+        "card_time_since_last_tx": "Rapid Transaction Repeat",
+        "card_counterparty_diversity_24h": "High Email Domain Diversity",
+        "card_distinct_emaildomain_24h": "Multiple Counterparty Domains",
+        "amt_z_for_card": "Unusual Amount for Card Profile",
+        "TransactionAmt": "High Dollar Amount",
+        "hour": "Off-Peak Time Pattern",
+        "card_amt_mean": "Deviates from Historical Card Avg",
+    }
+
+    pos_indices = np.argsort(shap_values)[::-1]
+    top_alerts = []
+
+    for idx in pos_indices:
+        feat = feature_names[idx]
+        val = input_row.get(feat, None) if isinstance(input_row, dict) else (input_row[feat] if feat in input_row else None)
+        shap_val = shap_values[idx]
+
+        if shap_val <= 0:
+            continue
+
+        desc = label_map.get(feat, f"Anomalous pattern in {feat}")
+        if feat == "card_tx_count_1h" and val is not None:
+            detail = f"{int(val)} tx in last 60 mins"
+        elif feat == "card_tx_count_24h" and val is not None:
+            detail = f"{int(val)} tx in last 24 hours"
+        elif feat == "card_time_since_last_tx" and val is not None:
+            detail = f"only {float(val):.1f}s since last tx"
+        elif feat == "card_counterparty_diversity_24h" and val is not None:
+            detail = f"{float(val):.2f} domain diversity ratio"
+        elif feat == "amt_z_for_card" and val is not None:
+            detail = f"{float(val):.2f} z-score relative to card mean"
+        elif feat == "TransactionAmt" and val is not None:
+            detail = f"${float(val):.2f} transaction amount"
+        else:
+            detail = f"value={val}" if val is not None else ""
+
+        top_alerts.append(f"{desc} ({detail})" if detail else desc)
+
+        if len(top_alerts) >= top_k:
+            break
+
+    if not top_alerts:
+        top_alerts = ["Baseline statistical fraud risk signature"]
+
+    return top_alerts
+
+
+# ==========================================
 # 2. PyTorch Neural Network Definition
 # ==========================================
 
@@ -464,14 +578,13 @@ def main():
     print("Saved PyTorch MLP model & preprocessors to models/")
 
     print("\n==================================================")
-    print(" 6. DECISION THRESHOLD & COST ANALYSIS (CALIBRATED MODEL)")
+    print(" 6. DYNAMIC VALUE-BASED COST ANALYSIS & OPERATIONAL ROUTING")
     print("==================================================")
     val_amounts = val_set["TransactionAmt"].values
-    FALSE_ALARM_COST = 5.0
     cost_results = []
 
-    print(f"{'Thresh':>7} | {'Precision':>9} | {'Recall':>7} | {'TP':>6} | {'FP':>6} | {'Total Cost ($)':>14}")
-    print("-" * 62)
+    print(f"{'Thresh':>7} | {'Precision':>9} | {'Recall':>7} | {'TP':>6} | {'FP':>6} | {'Dynamic Cost ($)':>16}")
+    print("-" * 65)
 
     for t in np.arange(0.01, 1.00, 0.01):
         preds = (iso_val_probs >= t).astype(int)
@@ -479,25 +592,24 @@ def main():
         prec = tp / (tp + fp) if (tp + fp) > 0 else 0
         rec = tp / (tp + fn) if (tp + fn) > 0 else 0
 
-        missed_fraud = (y_val.values == 1) & (preds == 0)
-        false_alarms = (y_val.values == 0) & (preds == 1)
-        missed_cost = val_amounts[missed_fraud].sum()
-        alarm_cost = false_alarms.sum() * FALSE_ALARM_COST
-        total_cost = missed_cost + alarm_cost
-        cost_results.append((t, total_cost, prec, rec, tp, fp, tn, fn))
+        dyn_cost = calculate_dynamic_cost(y_val.values, iso_val_probs, t, val_amounts)
+        cost_results.append((t, dyn_cost, prec, rec, tp, fp, tn, fn))
 
         if round(t, 2) in [0.01, 0.03, 0.05, 0.10, 0.20, 0.30, 0.50]:
-            print(f"{t:>7.2f} | {prec:>9.4f} | {rec:>7.4f} | {tp:>6,} | {fp:>6,} | ${total_cost:>13,.2f}")
+            print(f"{t:>7.2f} | {prec:>9.4f} | {rec:>7.4f} | {tp:>6,} | {fp:>6,} | ${dyn_cost:>15,.2f}")
 
     best_t, best_cost, best_prec, best_rec, best_tp, best_fp, best_tn, best_fn = min(cost_results, key=lambda r: r[1])
-    print(f"\nOptimal Cost-Minimizing Threshold (Isotonic XGB): {best_t:.2f}")
-    print(f"  Total Cost ($):        ${best_cost:,.2f}")
-    print(f"  Precision:             {best_prec * 100:.2f}%")
-    print(f"  Recall (Fraud caught): {best_rec * 100:.2f}%")
-    print(f"  Caught Fraud (TP):     {best_tp:>7,}")
-    print(f"  False Alarms (FP):     {best_fp:>7,}")
-    print(f"  Missed Fraud (FN):     {best_fn:>7,}")
-    print(f"  Correctly Passed (TN): {best_tn:>7,}")
+    print(f"\nOptimal Dynamic-Cost Threshold (Calibrated XGB): {best_t:.2f}")
+    print(f"  Total Dynamic Financial Loss ($): ${best_cost:,.2f}")
+    print(f"  Precision:                       {best_prec * 100:.2f}%")
+    print(f"  Recall (Fraud caught):           {best_rec * 100:.2f}%")
+    print(f"  Caught Fraud (TP):               {best_tp:>7,}")
+    print(f"  False Alarms (FP):               {best_fp:>7,}")
+    print(f"  Missed Fraud (FN):               {best_fn:>7,}")
+    print(f"  Correctly Passed (TN):           {best_tn:>7,}")
+
+    # Evaluate Three-Tiered Operational Action Zones
+    evaluate_three_tiered_action_zones(y_val.values, iso_val_probs, val_amounts, p_low=0.03, p_high=0.30)
 
     print("\n==================================================")
     print(" 7. SEALED TEST SET EVALUATION")
@@ -589,12 +701,14 @@ def main():
         "ProductCD_C", "ProductCD_R", "card6_credit", "card6_debit",
         "card4_discover", "hour"
     ]
-    print("\nEngineered Feature Rankings (out of total features):")
-    for f in engineered:
-        if f in imp_df["feature"].values:
-            rank = imp_df[imp_df["feature"] == f].index[0] + 1
-            val = imp_df[imp_df["feature"] == f]["mean_abs_shap"].values[0]
-            print(f"  {f:<18} rank {rank:>3} | SHAP: {val:.4f}")
+    print("\nOperational Explainability Sample Alert Extraction:")
+    sample_idx = 0
+    sample_row = sample_val.iloc[sample_idx]
+    sample_shap = shap_values[sample_idx]
+    alerts = explain_transaction_alert(sample_row, sample_shap, sample_val.columns, top_k=3)
+    print("  Sample Transaction Risk Alerts:")
+    for a in alerts:
+        print(f"   • {a}")
 
     print("\nPipeline execution complete successfully!")
 

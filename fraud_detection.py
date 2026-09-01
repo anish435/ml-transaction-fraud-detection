@@ -578,11 +578,39 @@ def main():
     print("Saved PyTorch MLP model & preprocessors to models/")
 
     print("\n==================================================")
-    print(" 6. DYNAMIC VALUE-BASED COST ANALYSIS & OPERATIONAL ROUTING")
+    print(" 6. DECISION THRESHOLD & COST ANALYSIS (BUSINESS DECISION LAYER)")
     print("==================================================")
     val_amounts = val_set["TransactionAmt"].values
-    cost_results = []
 
+    # 6a. Flat $5 Fixed False Alarm Cost Model
+    print("\n--- 6a. Flat $5 Fixed False Alarm Cost Model ---")
+    FALSE_ALARM_COST = 5.0
+    flat_results = []
+    print(f"{'Thresh':>7} | {'Precision':>9} | {'Recall':>7} | {'TP':>6} | {'FP':>6} | {'Flat Cost ($)':>14}")
+    print("-" * 62)
+
+    for t in np.arange(0.01, 1.00, 0.01):
+        preds = (iso_val_probs >= t).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_val, preds).ravel()
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+        missed_fraud = (y_val.values == 1) & (preds == 0)
+        false_alarms = (y_val.values == 0) & (preds == 1)
+        missed_cost = val_amounts[missed_fraud].sum()
+        alarm_cost = false_alarms.sum() * FALSE_ALARM_COST
+        total_flat = missed_cost + alarm_cost
+        flat_results.append((t, total_flat, prec, rec, tp, fp, tn, fn))
+
+        if round(t, 2) in [0.01, 0.03, 0.05, 0.10, 0.20, 0.30, 0.50]:
+            print(f"{t:>7.2f} | {prec:>9.4f} | {rec:>7.4f} | {tp:>6,} | {fp:>6,} | ${total_flat:>13,.2f}")
+
+    best_flat_t, best_flat_cost, b_f_p, b_f_r, b_f_tp, b_f_fp, b_f_tn, b_f_fn = min(flat_results, key=lambda r: r[1])
+    print(f"\nOptimal Flat-Cost Threshold (t={best_flat_t:.2f}): Total Cost = ${best_flat_cost:,.2f} | Prec = {b_f_p*100:.2f}% | Rec = {b_f_r*100:.2f}%")
+
+    # 6b. Dynamic Value-Based Financial Loss Model
+    print("\n--- 6b. Dynamic Value-Based Financial Loss Model ---")
+    dyn_results = []
     print(f"{'Thresh':>7} | {'Precision':>9} | {'Recall':>7} | {'TP':>6} | {'FP':>6} | {'Dynamic Cost ($)':>16}")
     print("-" * 65)
 
@@ -593,22 +621,15 @@ def main():
         rec = tp / (tp + fn) if (tp + fn) > 0 else 0
 
         dyn_cost = calculate_dynamic_cost(y_val.values, iso_val_probs, t, val_amounts)
-        cost_results.append((t, dyn_cost, prec, rec, tp, fp, tn, fn))
+        dyn_results.append((t, dyn_cost, prec, rec, tp, fp, tn, fn))
 
-        if round(t, 2) in [0.01, 0.03, 0.05, 0.10, 0.20, 0.30, 0.50]:
+        if round(t, 2) in [0.01, 0.03, 0.05, 0.07, 0.10, 0.20, 0.30, 0.50]:
             print(f"{t:>7.2f} | {prec:>9.4f} | {rec:>7.4f} | {tp:>6,} | {fp:>6,} | ${dyn_cost:>15,.2f}")
 
-    best_t, best_cost, best_prec, best_rec, best_tp, best_fp, best_tn, best_fn = min(cost_results, key=lambda r: r[1])
-    print(f"\nOptimal Dynamic-Cost Threshold (Calibrated XGB): {best_t:.2f}")
-    print(f"  Total Dynamic Financial Loss ($): ${best_cost:,.2f}")
-    print(f"  Precision:                       {best_prec * 100:.2f}%")
-    print(f"  Recall (Fraud caught):           {best_rec * 100:.2f}%")
-    print(f"  Caught Fraud (TP):               {best_tp:>7,}")
-    print(f"  False Alarms (FP):               {best_fp:>7,}")
-    print(f"  Missed Fraud (FN):               {best_fn:>7,}")
-    print(f"  Correctly Passed (TN):           {best_tn:>7,}")
+    best_dyn_t, best_dyn_cost, b_d_p, b_d_r, b_d_tp, b_d_fp, b_d_tn, b_d_fn = min(dyn_results, key=lambda r: r[1])
+    print(f"\nOptimal Dynamic-Cost Threshold (t={best_dyn_t:.2f}): Dynamic Loss = ${best_dyn_cost:,.2f} | Prec = {b_d_p*100:.2f}% | Rec = {b_d_r*100:.2f}%")
 
-    # Evaluate Three-Tiered Operational Action Zones
+    # 6c. Evaluate Three-Tiered Operational Action Zones
     evaluate_three_tiered_action_zones(y_val.values, iso_val_probs, val_amounts, p_low=0.03, p_high=0.30)
 
     print("\n==================================================")

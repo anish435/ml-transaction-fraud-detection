@@ -31,11 +31,14 @@ from torch.utils.data import TensorDataset, DataLoader
 import shap
 
 from src.features import fit_feature_pipeline, transform_features, make_Xy, compute_rolling_features
+from src.monitoring import compute_psi, interpret_psi
 
 
 # ==========================================
 # 1. Data Utility Functions
 # ==========================================
+
+
 
 def reduce_memory_size(df):
     """Downsize numeric columns to smallest safe dtypes to save memory."""
@@ -203,19 +206,7 @@ def evaluate_three_tiered_action_zones(y_true, y_prob, amounts, p_low=0.03, p_hi
 
 
 def explain_transaction_alert(input_row, shap_values, feature_names, top_k=3):
-    """Extract top positive SHAP drivers and map to human-readable operational alerts."""
-    label_map = {
-        "card_tx_count_1h": "High 1-Hour Velocity",
-        "card_tx_count_24h": "Extreme 24-Hour Velocity",
-        "card_time_since_last_tx": "Rapid Transaction Repeat",
-        "card_counterparty_diversity_24h": "High Email Domain Diversity",
-        "card_distinct_emaildomain_24h": "Multiple Counterparty Domains",
-        "amt_z_for_card": "Unusual Amount for Card Profile",
-        "TransactionAmt": "High Dollar Amount",
-        "hour": "Off-Peak Time Pattern",
-        "card_amt_mean": "Deviates from Historical Card Avg",
-    }
-
+    """Extract top positive SHAP drivers and map to logically accurate, human-readable operational alerts."""
     pos_indices = np.argsort(shap_values)[::-1]
     top_alerts = []
 
@@ -224,34 +215,55 @@ def explain_transaction_alert(input_row, shap_values, feature_names, top_k=3):
         val = input_row.get(feat, None) if isinstance(input_row, dict) else (input_row[feat] if feat in input_row else None)
         shap_val = shap_values[idx]
 
+        # Only features pushing towards fraud
         if shap_val <= 0:
             continue
 
-        desc = label_map.get(feat, f"Anomalous pattern in {feat}")
-        if feat == "card_tx_count_1h" and val is not None:
-            detail = f"{int(val)} tx in last 60 mins"
-        elif feat == "card_tx_count_24h" and val is not None:
-            detail = f"{int(val)} tx in last 24 hours"
-        elif feat == "card_time_since_last_tx" and val is not None:
-            detail = f"only {float(val):.1f}s since last tx"
-        elif feat == "card_counterparty_diversity_24h" and val is not None:
-            detail = f"{float(val):.2f} domain diversity ratio"
-        elif feat == "amt_z_for_card" and val is not None:
-            detail = f"{float(val):.2f} z-score relative to card mean"
-        elif feat == "TransactionAmt" and val is not None:
-            detail = f"${float(val):.2f} transaction amount"
+        if feat in ["C1", "C2", "C5", "C6", "C8", "C11", "C13", "C14"]:
+            if val is None or pd.isna(val) or float(val) == 0.0:
+                alert = f"Dormant / Zero Activity History ({feat}=0)"
+            elif float(val) > 10.0:
+                alert = f"Abnormal Spike in Activity Counter ({feat}={int(val)})"
+            elif float(val) > 3.0:
+                alert = f"Elevated Activity Counter ({feat}={int(val)})"
+            else:
+                alert = f"Unusual Counter Frequency ({feat}={val})"
+        elif feat == "TransactionAmt":
+            if val is not None and float(val) > 1000.0:
+                alert = f"High Dollar Amount (${float(val):.2f})"
+            elif val is not None and float(val) < 15.0:
+                alert = f"Micro-Transaction / Card Testing Amount (${float(val):.2f})"
+            else:
+                alert = f"Transaction Amount (${float(val):.2f})" if val is not None else "High Dollar Amount"
+        elif feat == "amt_z_for_card":
+            if val is not None and float(val) >= 2.0:
+                alert = f"Unusual Amount Spike (+{float(val):.2f}σ above card profile)"
+            elif val is not None and float(val) <= -1.5:
+                alert = f"Unusually Low Amount for Card Profile ({float(val):.2f}σ)"
+            else:
+                alert = f"Amount Deviation from Card Profile ({float(val):.2f}σ)" if val is not None else "Deviates from Card Historical Average"
+        elif feat == "card_tx_count_1h":
+            alert = f"High 1-Hour Velocity ({int(val)} tx in last 60 mins)" if val is not None and float(val) > 1 else "Rapid Velocity Trigger (1h)"
+        elif feat == "card_tx_count_24h":
+            alert = f"Elevated 24-Hour Velocity ({int(val)} tx in last 24h)" if val is not None and float(val) > 2 else "Elevated 24-Hour Velocity"
+        elif feat == "card_time_since_last_tx":
+            alert = f"Rapid Repeat Transaction (only {float(val):.1f}s since last tx)" if val is not None and float(val) < 60.0 else f"Short Interval Since Last Transaction ({float(val):.1f}s)"
+        elif feat == "hour":
+            alert = f"Late Night / Off-Peak Timing (Hour {int(val)}:00)" if val is not None and int(val) in [0, 1, 2, 3, 4, 5] else f"Time of Day Pattern (Hour {int(val)}:00)"
+        elif feat.startswith("V"):
+            alert = f"High-Risk Behavioral Signature ({feat}={val})" if val is not None and float(val) > 1.0 else f"Behavioral Signature ({feat}={val})"
+        elif feat.startswith("D"):
+            alert = f"Brand-New Account / Zero Days on File ({feat}=0)" if val is not None and float(val) == 0.0 else f"Profile History Anomaly ({feat}={val})"
+        elif feat.startswith("id_"):
+            alert = f"Identity / Device Anomaly ({feat}={val})"
         else:
-            detail = f"value={val}" if val is not None else ""
+            alert = f"Anomalous pattern in {feat} (value={val})" if val is not None and not pd.isna(val) else f"Anomalous pattern in {feat}"
 
-        top_alerts.append(f"{desc} ({detail})" if detail else desc)
-
+        top_alerts.append(alert)
         if len(top_alerts) >= top_k:
             break
 
-    if not top_alerts:
-        top_alerts = ["Baseline statistical fraud risk signature"]
-
-    return top_alerts
+    return top_alerts if top_alerts else ["Baseline statistical fraud profile match"]
 
 
 # ==========================================
@@ -378,6 +390,98 @@ def run_walk_forward_validation(train_data):
         print(f"  [✓] STABLE TEMPORAL PERFORMANCE: PR-AUC trend is stable across windows (W1: {pr_list[0]:.4f} -> W4: {pr_list[-1]:.4f}).")
 
     return wf_results
+
+
+# ==========================================
+# 3b. Population Stability Index (PSI) Monitoring
+# ==========================================
+
+def run_psi_monitoring(train_data, calibrated_xgb, state, top_shap_features):
+    """Compute Population Stability Index (PSI) between train baseline and val, test, and 4 WF windows."""
+    print("\n==================================================")
+    print(" 9. POPULATION STABILITY INDEX (PSI) MONITORING")
+    print("==================================================")
+    n = len(train_data)
+    train_end = int(n * 0.70)
+    val_end = int(n * 0.85)
+
+    train_raw = train_data.iloc[:train_end]
+    val_raw = train_data.iloc[train_end:val_end]
+    test_raw = train_data.iloc[val_end:]
+
+    # 4 distinct sequential 15% windows within the historical timeline
+    w1_raw = train_data.iloc[int(n * 0.10):int(n * 0.25)]
+    w2_raw = train_data.iloc[int(n * 0.25):int(n * 0.40)]
+    w3_raw = train_data.iloc[int(n * 0.40):int(n * 0.55)]
+    w4_raw = train_data.iloc[int(n * 0.55):int(n * 0.70)]
+
+    # Reference train scores sample
+    train_sample = train_raw.sample(n=min(50000, len(train_raw)), random_state=42)
+    X_train, _ = make_Xy(transform_features(train_sample, state), state)
+    train_probs = calibrated_xgb.predict_proba(X_train)[:, 1]
+
+    # Save baseline sample for batch scoring CLI
+    os.makedirs("models", exist_ok=True)
+    np.save("models/train_score_sample.npy", train_probs)
+
+    datasets = {
+        "Val Set (70-85%)": val_raw,
+        "Test Set (85-100%)": test_raw,
+        "WF Window 1 (10-25%)": w1_raw,
+        "WF Window 2 (25-40%)": w2_raw,
+        "WF Window 3 (40-55%)": w3_raw,
+        "WF Window 4 (55-70%)": w4_raw,
+    }
+
+    results = []
+    for name, target_raw in datasets.items():
+        target_sample = target_raw.sample(n=min(50000, len(target_raw)), random_state=42) if len(target_raw) > 50000 else target_raw
+        X_target, _ = make_Xy(transform_features(target_sample, state), state)
+        target_probs = calibrated_xgb.predict_proba(X_target)[:, 1]
+
+        # 1. Model Score PSI
+        score_psi = compute_psi(train_probs, target_probs, bins=10)
+        status, is_alert = interpret_psi(score_psi)
+        flag = "[!] DRIFT (>=0.25)" if is_alert else ("MODERATE" if status == "MODERATE_DRIFT" else "STABLE")
+        results.append({
+            "Target Window / Split": name,
+            "Metric / Feature": "Calibrated Score",
+            "PSI": score_psi,
+            "Status": status,
+            "Alert": flag,
+        })
+
+        # 2. Top SHAP features
+        for f in top_shap_features:
+            if f in train_sample.columns and f in target_sample.columns:
+                e_vals = train_sample[f].values
+                a_vals = target_sample[f].values
+                f_psi = compute_psi(e_vals, a_vals, bins=10)
+                f_status, f_alert = interpret_psi(f_psi)
+                f_flag = "[!] DRIFT (>=0.25)" if f_alert else ("MODERATE" if f_status == "MODERATE_DRIFT" else "STABLE")
+                results.append({
+                    "Target Window / Split": name,
+                    "Metric / Feature": f,
+                    "PSI": f_psi,
+                    "Status": f_status,
+                    "Alert": f_flag,
+                })
+
+    res_df = pd.DataFrame(results)
+    print(f"{'Target Window / Split':<24} | {'Metric / Feature':<18} | {'PSI':>8} | {'Status':<18} | {'Alert'}")
+    print("-" * 88)
+    for _, row in res_df.iterrows():
+        print(f"{row['Target Window / Split']:<24} | {row['Metric / Feature']:<18} | {row['PSI']:>8.4f} | {row['Status']:<18} | {row['Alert']}")
+
+    alerts = res_df[res_df["PSI"] >= 0.25]
+    if len(alerts) > 0:
+        print("\n[!] CRITICAL DRIFT ALERTS DETECTED (PSI >= 0.25):")
+        for _, row in alerts.iterrows():
+            print(f"    - {row['Target Window / Split']}: {row['Metric / Feature']} (PSI = {row['PSI']:.4f})")
+    else:
+        print("\n[OK] Population Stability Confirmed: No metric or feature exceeded the 0.25 drift threshold.")
+
+    return res_df
 
 
 # ==========================================
@@ -730,6 +834,10 @@ def main():
     print("  Sample Transaction Risk Alerts:")
     for a in alerts:
         print(f"   • {a}")
+
+    # Section 9: Population Stability Index (PSI) Monitoring
+    top_5_shap = imp_df["feature"].head(5).tolist()
+    run_psi_monitoring(train_data, calibrated_xgb, state, top_5_shap)
 
     print("\nPipeline execution complete successfully!")
 

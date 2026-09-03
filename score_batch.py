@@ -13,6 +13,7 @@ import pandas as pd
 import numpy as np
 
 from src.features import transform_features, make_Xy, compute_rolling_features
+from src.monitoring import compute_psi, interpret_psi
 
 
 def parse_args():
@@ -20,6 +21,7 @@ def parse_args():
     parser.add_argument("--input", required=True, help="Path to input raw transactions CSV file")
     parser.add_argument("--output", required=True, help="Path where scored CSV will be saved")
     parser.add_argument("--threshold", type=float, default=0.30, help="Decision threshold (default: 0.30)")
+    parser.add_argument("--check-psi", action="store_true", help="Compute Population Stability Index (PSI) drift against train baseline")
     return parser.parse_args()
 
 
@@ -97,6 +99,25 @@ def main():
     print(f"     Total Scored : {len(output_df):,}")
     print(f"     Flagged Fraud: {(preds == 1).sum():,} ({(preds == 1).mean() * 100:.2f}%)")
     print(f"     Approved     : {(preds == 0).sum():,} ({(preds == 0).mean() * 100:.2f}%)")
+
+    if args.check_psi:
+        baseline_path = "models/train_score_sample.npy"
+        if os.path.exists(baseline_path):
+            baseline_scores = np.load(baseline_path)
+            psi_val = compute_psi(baseline_scores, probs, bins=10)
+            status, is_alert = interpret_psi(psi_val)
+            print("\n--------------------------------------------------")
+            print(" POPULATION STABILITY INDEX (PSI) MONITORING")
+            print("--------------------------------------------------")
+            print(f" Batch Score PSI vs Train Baseline: {psi_val:.4f} ({status})")
+            if is_alert:
+                print(" [!] ALERT: Significant distribution drift detected (PSI >= 0.25). Model retraining recommended!")
+            elif status == "MODERATE_DRIFT":
+                print(" [*] WARNING: Moderate distribution drift detected (0.10 <= PSI < 0.25). Monitor upcoming batches closely.")
+            else:
+                print(" [OK] Score distribution is STABLE (PSI < 0.10).")
+        else:
+            print("\n[NOTE] Baseline scores ('models/train_score_sample.npy') not found. Run 'python fraud_detection.py' to generate baseline.")
 
 
 if __name__ == "__main__":

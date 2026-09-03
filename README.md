@@ -119,22 +119,83 @@ Train Set (70%)           Val Set (15%)              Test Set (15%)
 
 ---
 
+## 📉 Population Stability Index (PSI) Monitoring
+
+Monitors distribution drift between baseline training data and future time-based evaluation splits/windows using decile binning:
+$$\text{PSI} = \sum_{i=1}^{k} \left(\text{Actual}\%_i - \text{Expected}\%_i\right) \times \ln\left(\frac{\text{Actual}\%_i}{\text{Expected}\%_i}\right)$$
+
+| Target Window / Split | Calibrated Score | C13 | C14 | TransactionAmt | C5 | C1 | Status |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Validation Set (70–85%)** | **0.0014** | 0.0366 | 0.0125 | 0.0087 | 0.0172 | 0.0095 | **STABLE** |
+| **Sealed Test Set (85–100%)** | **0.0015** | 0.0259 | 0.0073 | 0.0048 | 0.0029 | 0.0120 | **STABLE** |
+| **WF Window 1 (10–25%)** | **0.0037** | 0.0543 | 0.0268 | 0.0273 | 0.0388 | 0.0259 | **STABLE** |
+| **WF Window 2 (25–40%)** | **0.0055** | 0.0124 | 0.0053 | 0.0106 | 0.0048 | 0.0046 | **STABLE** |
+| **WF Window 3 (40–55%)** | **0.0024** | 0.0101 | 0.0036 | 0.0062 | 0.0132 | 0.0042 | **STABLE** |
+| **WF Window 4 (55–70%)** | **0.0025** | 0.0074 | 0.0030 | 0.0073 | 0.0042 | 0.0026 | **STABLE** |
+
+*Thresholds*: $\text{PSI} < 0.10$ (**Stable**), $0.10 \le \text{PSI} < 0.25$ (**Moderate**), $\text{PSI} \ge 0.25$ (**[!] Significant Drift / Retrain Alert**).
+
+---
+
+## 🚀 Production Product Layer (FastAPI + Streamlit + Render)
+
+The system includes a production-grade inference microservice and an analyst dashboard for real-time fraud intervention:
+
+### 1. FastAPI Real-Time Microservice (`src/api/main.py`)
+- **Endpoints**:
+  - `POST /score`: Accepts single transaction payload, executes inference, and outputs calibrated probability, 3-tier routing action, top 3 logically-accurate SHAP alerts, and latency in ms (optional `?include_reasons=false`).
+  - `POST /score-fast` & `GET /score-fast`: Ultra-fast inference bypassing SHAP (~120ms single-row feature expansion vs ~198ms with SHAP).
+  - `GET /health`: Uptime and model readiness status.
+  - `GET /stats`: In-memory comparative rolling latency tracking ($p_{50}$, $p_{95}$, $p_{99}$) for both fast mode and explainable mode over the last 100 requests.
+- **Port Support**: Automatically binds to `$PORT` (default: 8000) for Render compatibility.
+
+```bash
+# Start FastAPI server
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+```
+
+### 2. Streamlit Risk Analyst Dashboard (`dashboard/app.py`)
+- **Features**:
+  - **1-Click Judge Presets**:
+    - 🟢 `Scenario 1: Low Risk (Grocery)` $\rightarrow$ **`ALLOW`** ($p = 0.0038$)
+    - 🟡 `Scenario 2: Elevated Risk Spike` $\rightarrow$ **`CHALLENGE (2FA / OTP)`** ($p = 0.1911$)
+    - 🔴 `Scenario 3: Extreme Syndicate Attack` $\rightarrow$ **`HARD_BLOCK`** ($p = 0.7778$)
+  - Real-time probability progress gauge & color-coded risk action badges.
+  - Actionable SHAP operational alerts bullet list.
+  - Live comparative latency SLA telemetry.
+
+```bash
+# Start Streamlit Dashboard (connects to FastAPI via API_BASE_URL)
+streamlit run dashboard/app.py
+```
+
+---
+
 ## 🏃 Project Structure & Running the Code
 
 ```
 ml-transaction-fraud-detection/
-├── src/                        # Feature Engineering Pipeline
-│   └── features.py             # Leakage-safe fit/transform & rolling features
+├── src/
+│   ├── api/
+│   │   ├── __init__.py
+│   │   └── main.py             # FastAPI Microservice (POST /score, GET /health, GET /stats)
+│   ├── features.py             # Leakage-safe fit/transform & rolling features
+│   └── monitoring.py           # Standalone Population Stability Index (PSI) engine
+├── dashboard/
+│   ├── app.py                  # Streamlit Risk Analyst Dashboard
+│   └── presets.json            # 1-Click verified judge demo presets
 ├── models/                     # Saved Model Assets & Preprocessors
 │   ├── feature_state.pkl
 │   ├── calibrated_xgb.pkl
 │   ├── xgb_baseline.pkl
 │   ├── stacking_weights.pkl
+│   ├── train_score_sample.npy
 │   └── fraud_mlp.pt
 ├── images/                     # Generated Visualizations
 │   └── walk_forward_trend.png  # Walk-forward validation temporal trend
+├── render.yaml                 # Render web service infrastructure-as-code
 ├── fraud_detection.py          # Main End-to-End Dual-Layer Pipeline Script
-├── score_batch.py              # CLI Batch Inference Script (with operational_action)
+├── score_batch.py              # CLI Batch Inference Script (supports --check-psi)
 ├── predict_transaction.py      # Interactive Real-Time Simulator (ALLOW/CHALLENGE/HARD_BLOCK)
 ├── fraud_detection.ipynb       # Project Jupyter Notebook
 ├── README.md                   # Dual-Layer Architecture Documentation
@@ -144,14 +205,17 @@ ml-transaction-fraud-detection/
 ### Running the Code
 
 ```bash
-# Run full pipeline with dual-layer evaluation (Statistical + Business)
+# 1. Run full pipeline with dual-layer evaluation (Statistical + Business)
 python fraud_detection.py
 
-# Batch scoring CLI (outputs fraud_probability and operational_action)
-python score_batch.py --input data/new_transactions.csv --output data/scored.csv --threshold 0.07
+# 2. Launch FastAPI Inference Microservice
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000
 
-# Interactive simulator CLI
-python predict_transaction.py
+# 3. Launch Streamlit Risk Dashboard
+streamlit run dashboard/app.py
+
+# 4. Batch scoring CLI (outputs fraud_probability and operational_action)
+python score_batch.py --input data/new_transactions.csv --output data/scored.csv --threshold 0.07 --check-psi
 ```
 
 ---

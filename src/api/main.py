@@ -28,7 +28,9 @@ import pandas as pd
 import shap
 import uvicorn
 from dotenv import load_dotenv
+import threading
 from fastapi import FastAPI, HTTPException, Query, Request, Header
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -54,6 +56,15 @@ from src.defense import defense_system
 LATENCY_WINDOW = 100
 latency_with_shap = deque(maxlen=LATENCY_WINDOW)
 latency_without_shap = deque(maxlen=LATENCY_WINDOW)
+
+# Thread-safe circular buffer for live scored transactions feed
+recent_transactions = deque(maxlen=200)
+tx_lock = threading.Lock()
+
+def record_recent_transaction(entry: dict):
+    """Thread-safe append of a scored transaction to recent feed."""
+    with tx_lock:
+        recent_transactions.appendleft(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +223,34 @@ async def lifespan(app: FastAPI):
     print(f"[OK] Operational routing thresholds set: ALLOW < {p_low:.4f} <= CHALLENGE < {p_high:.4f} <= HARD_BLOCK")
     print(f"[OK] Defense Circuit Breaker synchronized: Base [{p_low:.4f}, {p_high:.4f}] | Defense [{defense_system.circuit_breaker.defense_p_low:.4f}, {defense_system.circuit_breaker.defense_p_high:.4f}]")
 
+    # Seed recent_transactions from existing razorpay_audit_log if present
+    audit_file = os.path.join(REPO_ROOT, "data", "razorpay_audit_log.jsonl")
+    if os.path.exists(audit_file):
+        try:
+            with open(audit_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entry = json.loads(line)
+                        record_recent_transaction({
+                            "id": entry.get("payment_id", f"tx_{int(time.time()*1000)}"),
+                            "timestamp": entry.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                            "amount": entry.get("amount", entry.get("amount_inr", 0.0)),
+                            "currency": entry.get("currency", "INR"),
+                            "fraud_probability": entry.get("fraud_probability", 0.0),
+                            "risk_tier": entry.get("risk_tier", "ALLOW"),
+                            "decision": entry.get("decision", entry.get("risk_tier", "ALLOW")),
+                            "reasons": entry.get("reasons", ["Baseline statistical fraud profile match"]),
+                            "latency_ms": entry.get("latency_ms", 18.5),
+                            "card4": entry.get("features_real", {}).get("card4", "visa") if isinstance(entry.get("features_real"), dict) else "visa",
+                            "card6": entry.get("features_real", {}).get("card6", "credit") if isinstance(entry.get("features_real"), dict) else "credit",
+                            "email": entry.get("customer_identifier", "shopper@example.com"),
+                            "circuit_breaker_state": entry.get("circuit_breaker_state", "NORMAL"),
+                            "defense_action": entry.get("defense_action", "STANDARD_ROUTING"),
+                        })
+        except Exception:
+            pass
+
     yield
     model_assets.clear()
 
@@ -221,6 +260,15 @@ app = FastAPI(
     description="Sub-50ms inference API with Isotonic Calibration, Three-Tiered Operational Routing, and Local SHAP Explainability.",
     version="1.3.0",
     lifespan=lifespan,
+)
+
+# Enable CORS for frontend dashboard and developer clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -385,7 +433,7 @@ def score_transaction(payload: TransactionInput, include_reasons: bool = Query(T
         latency_without_shap.append(latency_ms)
         shap_calc = False
 
-    return ScoreResponse(
+    shap_res = ScoreResponse(
         fraud_probability=round(prob, 4),
         risk_tier=risk_tier,
         reasons=reasons,
@@ -396,6 +444,23 @@ def score_transaction(payload: TransactionInput, include_reasons: bool = Query(T
         defense_action=defense_res.get("defense_action", "STANDARD_ROUTING"),
         defense_note=defense_res.get("defense_note"),
     )
+    record_recent_transaction({
+        "id": f"tx_{int(time.time()*1000)}_{int(time.perf_counter()*1000)%1000}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "amount": round(float(input_dict.get("TransactionAmt", 0.0)), 2),
+        "currency": "USD",
+        "fraud_probability": round(prob, 4),
+        "risk_tier": risk_tier,
+        "decision": risk_tier,
+        "reasons": reasons,
+        "latency_ms": latency_ms,
+        "card4": str(input_dict.get("card4", "visa")),
+        "card6": str(input_dict.get("card6", "credit")),
+        "email": str(input_dict.get("P_emaildomain", "shopper@example.com")),
+        "circuit_breaker_state": defense_res.get("circuit_breaker_state", "NORMAL"),
+        "defense_action": defense_res.get("defense_action", "STANDARD_ROUTING"),
+    })
+    return shap_res
 
 
 @app.post("/score-fast", response_model=FastScoreResponse, summary="Score Single Transaction (Ultra-Fast, No SHAP)")
@@ -410,7 +475,7 @@ def score_transaction_fast_post(payload: TransactionInput):
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
     latency_without_shap.append(latency_ms)
 
-    return FastScoreResponse(
+    fast_res = FastScoreResponse(
         fraud_probability=round(prob, 4),
         risk_tier=risk_tier,
         model_version="v1.3.0-calibrated-xgb",
@@ -420,6 +485,23 @@ def score_transaction_fast_post(payload: TransactionInput):
         defense_action=defense_res.get("defense_action", "STANDARD_ROUTING"),
         defense_note=defense_res.get("defense_note"),
     )
+    record_recent_transaction({
+        "id": f"tx_fast_{int(time.time()*1000)}_{int(time.perf_counter()*1000)%1000}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "amount": round(float(input_dict.get("TransactionAmt", 0.0)), 2),
+        "currency": "USD",
+        "fraud_probability": round(prob, 4),
+        "risk_tier": risk_tier,
+        "decision": risk_tier,
+        "reasons": [defense_res["defense_note"]] if defense_res.get("defense_note") else ["Fast-mode inference (SHAP attribution bypassed for low latency)"],
+        "latency_ms": latency_ms,
+        "card4": str(input_dict.get("card4", "visa")),
+        "card6": str(input_dict.get("card6", "credit")),
+        "email": str(input_dict.get("P_emaildomain", "shopper@example.com")),
+        "circuit_breaker_state": defense_res.get("circuit_breaker_state", "NORMAL"),
+        "defense_action": defense_res.get("defense_action", "STANDARD_ROUTING"),
+    })
+    return fast_res
 
 
 @app.get("/score-fast", response_model=FastScoreResponse, summary="GET Rapid Probe (Ultra-Fast, No SHAP)")
@@ -448,7 +530,7 @@ def score_transaction_fast_get(
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
     latency_without_shap.append(latency_ms)
 
-    return FastScoreResponse(
+    probe_res = FastScoreResponse(
         fraud_probability=round(prob, 4),
         risk_tier=risk_tier,
         model_version="v1.3.0-calibrated-xgb",
@@ -458,6 +540,23 @@ def score_transaction_fast_get(
         defense_action=defense_res.get("defense_action", "STANDARD_ROUTING"),
         defense_note=defense_res.get("defense_note"),
     )
+    record_recent_transaction({
+        "id": f"tx_probe_{int(time.time()*1000)}_{int(time.perf_counter()*1000)%1000}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "amount": round(float(TransactionAmt), 2),
+        "currency": "USD",
+        "fraud_probability": round(prob, 4),
+        "risk_tier": risk_tier,
+        "decision": risk_tier,
+        "reasons": [defense_res["defense_note"]] if defense_res.get("defense_note") else ["GET query parameter probe"],
+        "latency_ms": latency_ms,
+        "card4": card4,
+        "card6": card6,
+        "email": "probe@api.local",
+        "circuit_breaker_state": defense_res.get("circuit_breaker_state", "NORMAL"),
+        "defense_action": defense_res.get("defense_action", "STANDARD_ROUTING"),
+    })
+    return probe_res
 
 
 def _calc_stats(deq: deque) -> LatencyStats:
@@ -640,6 +739,24 @@ async def razorpay_webhook(
         # Append to audit trail
         append_audit_log(audit_entry)
 
+        # Append to live transaction stream
+        record_recent_transaction({
+            "id": audit_entry["payment_id"],
+            "timestamp": audit_entry["timestamp"],
+            "amount": audit_entry["amount"],
+            "currency": audit_entry["currency"],
+            "fraud_probability": audit_entry["fraud_probability"],
+            "risk_tier": audit_entry["risk_tier"],
+            "decision": audit_entry["decision"],
+            "reasons": audit_entry["reasons"],
+            "latency_ms": audit_entry["latency_ms"],
+            "card4": payment.get("card", {}).get("network", "visa") if isinstance(payment.get("card"), dict) else "visa",
+            "card6": payment.get("card", {}).get("type", "credit") if isinstance(payment.get("card"), dict) else "credit",
+            "email": customer_id,
+            "circuit_breaker_state": audit_entry["circuit_breaker_state"],
+            "defense_action": audit_entry["defense_action"],
+        })
+
         return {
             "status": "processed",
             "payment_id": audit_entry["payment_id"],
@@ -754,8 +871,190 @@ def remove_entity_suppression(payload: SuppressionRemoveRequest):
     return {"status": "removed", "entity_id": payload.entity_id}
 
 
+# ---------------------------------------------------------------------------
+# Demo Simulation & Transaction History Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/transactions/recent", summary="Retrieve Recent Live Scored Transactions")
+def get_recent_transactions(limit: int = Query(50, description="Max transactions to return")):
+    """Return in-memory stream of recent live transactions scored by the engine."""
+    with tx_lock:
+        txs = list(recent_transactions)[:limit]
+    return {"total": len(txs), "transactions": txs}
 
 
+@app.post("/demo/simulate-normal", summary="Simulate Normal Payment Transaction")
+def simulate_normal_payment():
+    """
+    Simulate a clean, authentic payment transaction from verified presets.
+    Runs full feature transformation, ML scoring, and defense pipeline.
+    """
+    presets_path = os.path.join(REPO_ROOT, "dashboard", "presets.json")
+    payload_dict = {"TransactionAmt": 149.00, "card1": 2377, "ProductCD": "W", "card4": "visa", "card6": "debit", "hour": 14, "P_emaildomain": "gmail.com"}
+    if os.path.exists(presets_path):
+        try:
+            with open(presets_path, "r") as f:
+                presets = json.load(f)
+                payload_dict = presets.get("allow", payload_dict).copy()
+        except Exception:
+            pass
+
+    import random
+    payload_dict["TransactionAmt"] = round(float(payload_dict.get("TransactionAmt", 149.0)) * random.uniform(0.85, 1.25), 2)
+    payload_dict["TransactionID"] = int(time.time() * 1000) % 10000000
+
+    t0 = time.perf_counter()
+    prob, risk_tier, X, defense_res = _score_raw(payload_dict)
+    explainer = model_assets.get("explainer")
+    reasons = []
+    if explainer:
+        shap_vals = explainer.shap_values(X)[0]
+        reasons = generate_shap_alerts(payload_dict, shap_vals, list(X.columns), top_k=3)
+    if defense_res.get("defense_note"):
+        reasons.insert(0, f"🛡️ {defense_res['defense_note']}")
+
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    latency_with_shap.append(latency_ms)
+
+    tx_rec = {
+        "id": f"pay_norm_{int(time.time()*1000)}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "amount": payload_dict["TransactionAmt"],
+        "currency": "USD",
+        "fraud_probability": round(prob, 4),
+        "risk_tier": risk_tier,
+        "decision": risk_tier,
+        "reasons": reasons,
+        "latency_ms": latency_ms,
+        "card4": str(payload_dict.get("card4", "visa")),
+        "card6": str(payload_dict.get("card6", "debit")),
+        "email": str(payload_dict.get("P_emaildomain", "shopper@gmail.com")),
+        "circuit_breaker_state": defense_res.get("circuit_breaker_state", "NORMAL"),
+        "defense_action": defense_res.get("defense_action", "STANDARD_ROUTING"),
+    }
+    record_recent_transaction(tx_rec)
+    return {
+        "status": "success",
+        "transaction": tx_rec,
+        "defense_status": defense_system.get_full_status(),
+    }
+
+
+@app.post("/demo/simulate-spike", summary="Simulate Gateway Fraud Risk Spike")
+def simulate_fraud_spike():
+    """
+    Simulate a rapid burst of high-risk / fraudulent transactions.
+    Scores 5 high-risk payloads in rapid succession to trigger the real
+    GatewaySpikeDetector, trip the Circuit Breaker to DEFENSE_ACTIVE,
+    and create an active Incident.
+    """
+    presets_path = os.path.join(REPO_ROOT, "dashboard", "presets.json")
+    base_block = {"TransactionAmt": 84.83, "card1": 14076, "ProductCD": "C", "card4": "visa", "card6": "credit", "P_emaildomain": "hotmail.com"}
+    if os.path.exists(presets_path):
+        try:
+            with open(presets_path, "r") as f:
+                presets = json.load(f)
+                base_block = presets.get("block", base_block).copy()
+        except Exception:
+            pass
+
+    import random
+    scored_burst = []
+    for i in range(5):
+        burst_payload = base_block.copy()
+        burst_payload["TransactionAmt"] = round(float(burst_payload.get("TransactionAmt", 85.0)) + random.uniform(10.0, 50.0), 2)
+        burst_payload["P_emaildomain"] = f"carder_bot_{i}@throwaway.xyz"
+        burst_payload["card1"] = 14076 + i
+
+        t0 = time.perf_counter()
+        prob, risk_tier, X, defense_res = _score_raw(burst_payload, entity_id=burst_payload["P_emaildomain"])
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        latency_with_shap.append(latency_ms)
+
+        reasons = ["Abnormal velocity spike (botnet pattern)", "High-risk counterparty domain", "Deviates from standard card profile"]
+        if defense_res.get("defense_note"):
+            reasons.insert(0, f"🛡️ {defense_res['defense_note']}")
+
+        tx_rec = {
+            "id": f"pay_spike_{int(time.time()*1000)}_{i}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "amount": burst_payload["TransactionAmt"],
+            "currency": "USD",
+            "fraud_probability": round(prob, 4),
+            "risk_tier": risk_tier,
+            "decision": risk_tier,
+            "reasons": reasons,
+            "latency_ms": latency_ms,
+            "card4": str(burst_payload.get("card4", "visa")),
+            "card6": str(burst_payload.get("card6", "credit")),
+            "email": burst_payload["P_emaildomain"],
+            "circuit_breaker_state": defense_res.get("circuit_breaker_state", "NORMAL"),
+            "defense_action": defense_res.get("defense_action", "DEFENSE_TIGHTENED_ROUTING"),
+        }
+        record_recent_transaction(tx_rec)
+        scored_burst.append(tx_rec)
+
+    return {
+        "status": "spike_triggered",
+        "transactions_scored": len(scored_burst),
+        "recent_burst": scored_burst,
+        "defense_status": defense_system.get_full_status(),
+    }
+
+
+@app.post("/demo/simulate-recovery", summary="Simulate Gateway Traffic Recovery")
+def simulate_gateway_recovery():
+    """
+    Simulate traffic returning to normal healthy baseline.
+    Transitions circuit breaker from DEFENSE_ACTIVE through COOLDOWN to NORMAL.
+    """
+    # 1. Clear spike detector sliding window
+    defense_system.spike_detector.clear()
+
+    # 2. Record 6 clean low-risk transactions to establish sustained healthy traffic
+    import random
+    clean_txs = []
+    for i in range(6):
+        amt = round(random.uniform(25.0, 180.0), 2)
+        telemetry = defense_system.spike_detector.record_transaction(
+            prob=0.012,
+            risk_tier="ALLOW",
+            amount=amt,
+            entity_id=f"clean_user_{i}@gmail.com",
+            current_ts=time.time(),
+        )
+        clean_txs.append(amt)
+
+    # 3. Trigger circuit breaker recovery
+    curr_ts = time.time() + 100.0  # Advance past cooldown window (60s)
+    new_state, transition = defense_system.circuit_breaker.evaluate_traffic_and_update(
+        telemetry=defense_system.spike_detector.get_telemetry(),
+        is_healthy=True,
+        current_ts=curr_ts,
+    )
+    if new_state != "NORMAL":
+        defense_system.circuit_breaker.manual_reset()
+
+    defense_system.incident_manager.resolve_incident(
+        reason="Auto-recovered: Gateway traffic returned to baseline (fraud rate < 5%)"
+    )
+
+    return {
+        "status": "recovered",
+        "circuit_breaker_state": defense_system.circuit_breaker.get_state(),
+        "defense_status": defense_system.get_full_status(),
+    }
+
+
+@app.post("/demo/reset", summary="Reset Demo State to Clean Baseline")
+def reset_demo_state():
+    """Reset circuit breaker, active incidents, and defense telemetry to initial clean state."""
+    defense_system.circuit_breaker.manual_reset()
+    defense_system.incident_manager.resolve_incident(reason="Manual demo state reset")
+    defense_system.spike_detector.clear()
+    return {
+        "status": "reset_complete",
+        "defense_status": defense_system.get_full_status(),
+    }
 
 
 if __name__ == "__main__":

@@ -1,0 +1,88 @@
+{
+  "thresholds": {
+    "p_low_allow_challenge": 0.080385,
+    "p_high_challenge_block": 0.749492,
+    "optimization_objective": "max(net_savings_lakhs), tiebreak max(recall)",
+    "constraints_applied": {
+      "challenge_rate_max_pct": 6.0,
+      "auto_block_precision_min_pct": 90.0
+    },
+    "tuned_on": "validation_set_70pct_85pct",
+    "evaluated_on": "sealed_test_set_85pct_100pct"
+  },
+  "val_metrics": {
+    "challenge_rate_pct": 5.8353,
+    "auto_block_precision_pct": 90.3294,
+    "net_savings_lakhs": 78.4537,
+    "ml_recall_pct": 27.9421,
+    "vw_recall_pct": 19.2453,
+    "ml_precision_pct": 90.3294
+  },
+  "ml_detection": {
+    "precision_pct": 86.4455,
+    "recall_pct": 29.5816,
+    "pr_auc": 0.5124,
+    "roc_auc": 0.8927
+  },
+  "financial_cost": {
+    "net_merchant_savings_inr_lakhs": 61.4946,
+    "fraud_caught_usd": 75790.2,
+    "fraud_missed_usd": 393818.31,
+    "value_weighted_recall_pct": 16.139,
+    "net_merchant_savings_usd": 74089.88
+  },
+  "merchant_funnel": {
+    "auto_block_precision_pct": 86.4455,
+    "challenge_rate_pct": 6.5116,
+    "allow_rate_pct": 92.2974,
+    "block_rate_pct": 1.191
+  },
+  "operations": {
+    "inference_latency_p50_ms": 18.67,
+    "inference_latency_p95_ms": 57.13,
+    "inference_latency_p99_ms": 60.07
+  },
+  "confusion_matrix": {
+    "p_high_threshold": 0.749492,
+    "TP": 912,
+    "FP": 143,
+    "FN": 2171,
+    "TN": 85355,
+    "threshold": 0.749492
+  },
+  "ensemble_weights": {
+    "w_lr": 0.0,
+    "w_nn": 0.0,
+    "w_xgb": 0.30000000000000004,
+    "w_lgbm": 0.7
+  },
+  "pipeline_version": "v2.1.0-threshold-optimised",
+  "model_comparison": {
+    "logistic_regression": {
+      "roc_auc": 0.8267,
+      "pr_auc": 0.1739
+    },
+    "mlp_neural_net": {
+      "roc_auc": 0.8491,
+      "pr_auc": 0.4284
+    },
+    "xgboost_calibrated": {
+      "roc_auc": 0.8877,
+      "pr_auc": 0.5057
+    },
+    "lightgbm_calibrated": {
+      "roc_auc": 0.8919,
+      "pr_auc": 0.5109
+    },
+    "ensemble_blend": {
+      "roc_auc": 0.8927,
+      "pr_auc": 0.5124,
+      "weights": {
+        "LR": 0.0,
+        "MLP": 0.0,
+        "XGB": 0.3,
+        "LGBM": 0.7
+      }
+    }
+  }
+}

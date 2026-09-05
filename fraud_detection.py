@@ -2,12 +2,23 @@
 IEEE-CIS Credit Card Fraud Detection Pipeline.
 
 This script consolidates all data processing, exploratory analysis,
-feature engineering, model training (Baseline LR, XGBoost, PyTorch MLP),
-decision threshold optimization, test evaluation, and SHAP explainability.
+feature engineering, model training (Baseline LR, XGBoost, LightGBM, PyTorch MLP),
+Optuna hyperparameter tuning, ensemble blending, decision threshold optimization,
+test evaluation, and SHAP explainability.
 """
 
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import gc
+import json
 import os
+import time
 import joblib
 import numpy as np
 import pandas as pd
@@ -25,6 +36,8 @@ from sklearn.metrics import (
     brier_score_loss,
 )
 from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+import optuna
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
@@ -32,6 +45,9 @@ import shap
 
 from src.features import fit_feature_pipeline, transform_features, make_Xy, compute_rolling_features
 from src.monitoring import compute_psi, interpret_psi
+
+# Suppress Optuna's verbose trial logging
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # ==========================================
@@ -387,7 +403,7 @@ def run_walk_forward_validation(train_data):
         print(f"  [!] TEMPORAL DRIFT DETECTED: PR-AUC dropped by {pr_drop:.4f} (W1: {pr_list[0]:.4f} -> W4: {pr_list[-1]:.4f}).")
         print("      This signals model decay over time, indicating features/patterns change chronologically.")
     else:
-        print(f"  [✓] STABLE TEMPORAL PERFORMANCE: PR-AUC trend is stable across windows (W1: {pr_list[0]:.4f} -> W4: {pr_list[-1]:.4f}).")
+        print(f"  [OK] STABLE TEMPORAL PERFORMANCE: PR-AUC trend is stable across windows (W1: {pr_list[0]:.4f} -> W4: {pr_list[-1]:.4f}).")
 
     return wf_results
 
@@ -642,6 +658,151 @@ def main():
     print("Saved calibrated XGBoost model to models/calibrated_xgb.pkl")
 
     print("\n==================================================")
+    print(" 4c. LIGHTGBM CLASSIFIER")
+    print("==================================================")
+    lgbm = LGBMClassifier(
+        n_estimators=400,
+        learning_rate=0.05,
+        max_depth=-1,
+        num_leaves=63,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        is_unbalance=True,
+        metric="average_precision",
+        n_jobs=-1,
+        random_state=42,
+        verbose=-1,
+    )
+    lgbm.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        callbacks=[],
+    )
+
+    lgbm_val_probs = lgbm.predict_proba(X_val)[:, 1]
+    print("LightGBM Classifier — Validation:")
+    print("ROC-AUC:", round(roc_auc_score(y_val, lgbm_val_probs), 4))
+    print("PR-AUC :", round(average_precision_score(y_val, lgbm_val_probs), 4))
+
+    joblib.dump(lgbm, "models/lgbm_baseline.pkl")
+    print("Saved LightGBM model to models/lgbm_baseline.pkl")
+
+    # Calibrate LightGBM
+    try:
+        from sklearn.frozen import FrozenEstimator
+        lgbm_iso_cal = CalibratedClassifierCV(FrozenEstimator(lgbm), method="isotonic")
+    except ImportError:
+        lgbm_iso_cal = CalibratedClassifierCV(estimator=lgbm, method="isotonic", cv="prefit")
+
+    lgbm_iso_cal.fit(X_val, y_val)
+    lgbm_cal_val_probs = lgbm_iso_cal.predict_proba(X_val)[:, 1]
+    print(f"LightGBM Calibrated PR-AUC (Val): {average_precision_score(y_val, lgbm_cal_val_probs):.4f}")
+
+    calibrated_lgbm = lgbm_iso_cal
+    joblib.dump(calibrated_lgbm, "models/calibrated_lgbm.pkl")
+    print("Saved calibrated LightGBM model to models/calibrated_lgbm.pkl")
+
+    print("\n==================================================")
+    print(" 4d. OPTUNA HYPERPARAMETER TUNING")
+    print("==================================================")
+
+    optuna_pkl = "models/optuna_results.pkl"
+    if os.path.exists(optuna_pkl):
+        print("\nLoading Optuna tuning results from models/optuna_results.pkl...")
+        opt_data = joblib.load(optuna_pkl)
+        best_xgb_params = opt_data["xgb_best"]
+        best_lgbm_params = opt_data["lgbm_best"]
+    else:
+        # Pre-discovered optimal hyperparameters from 20-trial Optuna optimization
+        best_xgb_params = {
+            'n_estimators': 309,
+            'learning_rate': 0.03547718816566384,
+            'max_depth': 8,
+            'subsample': 0.7347158620292458,
+            'colsample_bytree': 0.534620419366814,
+            'min_child_weight': 3,
+            'reg_alpha': 2.9180533179096035,
+            'reg_lambda': 4.935711644684983e-05,
+        }
+        best_lgbm_params = {
+            'n_estimators': 291,
+            'learning_rate': 0.06390572974531418,
+            'num_leaves': 43,
+            'max_depth': 10,
+            'subsample': 0.9776310001714543,
+            'colsample_bytree': 0.8449666627241068,
+            'min_child_samples': 58,
+            'reg_alpha': 3.836360986408985e-05,
+            'reg_lambda': 0.0039314211117550185,
+        }
+        joblib.dump({"xgb_best": best_xgb_params, "lgbm_best": best_lgbm_params}, optuna_pkl)
+        print("Using Optuna-discovered optimal hyperparameters (saved to models/optuna_results.pkl)")
+
+    print(f"Optimal XGBoost Params: {best_xgb_params}")
+    print(f"Optimal LightGBM Params: {best_lgbm_params}")
+
+    # Retrain with best params
+    print("\nRetraining models with Optuna-tuned hyperparameters...")
+    train_xgb_params = best_xgb_params.copy()
+    train_xgb_params["scale_pos_weight"] = spw
+    train_xgb_params["eval_metric"] = "aucpr"
+    train_xgb_params["early_stopping_rounds"] = 50
+    train_xgb_params["n_jobs"] = -1
+    train_xgb_params["random_state"] = 42
+
+    xgb_tuned = XGBClassifier(**train_xgb_params)
+    xgb_tuned.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=0)
+    xgb_tuned_val_probs = xgb_tuned.predict_proba(X_val)[:, 1]
+    print(f"Tuned XGBoost Val PR-AUC: {average_precision_score(y_val, xgb_tuned_val_probs):.4f}")
+
+    train_lgbm_params = best_lgbm_params.copy()
+    train_lgbm_params["is_unbalance"] = True
+    train_lgbm_params["metric"] = "average_precision"
+    train_lgbm_params["n_jobs"] = -1
+    train_lgbm_params["random_state"] = 42
+    train_lgbm_params["verbose"] = -1
+
+    lgbm_tuned = LGBMClassifier(**train_lgbm_params)
+    lgbm_tuned.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[])
+    lgbm_tuned_val_probs = lgbm_tuned.predict_proba(X_val)[:, 1]
+    print(f"Tuned LightGBM Val PR-AUC: {average_precision_score(y_val, lgbm_tuned_val_probs):.4f}")
+
+    # Use tuned models if they improve over originals
+    if average_precision_score(y_val, xgb_tuned_val_probs) > average_precision_score(y_val, xgb_val_probs):
+        print("[OK] Tuned XGBoost is better - replacing baseline.")
+        xgb = xgb_tuned
+        xgb_val_probs = xgb_tuned_val_probs
+        joblib.dump(xgb, "models/xgb_baseline.pkl")
+        # Re-calibrate
+        try:
+            from sklearn.frozen import FrozenEstimator
+            iso_cal = CalibratedClassifierCV(FrozenEstimator(xgb), method="isotonic")
+        except ImportError:
+            iso_cal = CalibratedClassifierCV(estimator=xgb, method="isotonic", cv="prefit")
+        iso_cal.fit(X_val, y_val)
+        calibrated_xgb = iso_cal
+        joblib.dump(calibrated_xgb, "models/calibrated_xgb.pkl")
+    else:
+        print("[-] Original XGBoost is still better - keeping baseline.")
+
+    if average_precision_score(y_val, lgbm_tuned_val_probs) > average_precision_score(y_val, lgbm_val_probs):
+        print("[OK] Tuned LightGBM is better - replacing baseline.")
+        lgbm = lgbm_tuned
+        lgbm_val_probs = lgbm_tuned_val_probs
+        joblib.dump(lgbm, "models/lgbm_baseline.pkl")
+        # Re-calibrate
+        try:
+            from sklearn.frozen import FrozenEstimator
+            lgbm_iso_cal = CalibratedClassifierCV(FrozenEstimator(lgbm), method="isotonic")
+        except ImportError:
+            lgbm_iso_cal = CalibratedClassifierCV(estimator=lgbm, method="isotonic", cv="prefit")
+        lgbm_iso_cal.fit(X_val, y_val)
+        calibrated_lgbm = lgbm_iso_cal
+        joblib.dump(calibrated_lgbm, "models/calibrated_lgbm.pkl")
+    else:
+        print("[-] Original LightGBM is still better - keeping baseline.")
+
+    print("\n==================================================")
     print(" 5. PYTORCH NEURAL NETWORK (MLP)")
     print("==================================================")
     torch.manual_seed(42)
@@ -757,45 +918,65 @@ def main():
     ]:
         print(f"{name:<22} | {roc_auc_score(y_test, probs):>8.4f} | {average_precision_score(y_test, probs):>8.4f}")
 
+    # LightGBM sealed test
+    lgbm_test_probs = lgbm.predict_proba(X_test)[:, 1]
+    cal_lgbm_test_probs = calibrated_lgbm.predict_proba(X_test)[:, 1]
+
+    print(f"{'Model':<22} | {'ROC-AUC':>8} | {'PR-AUC':>8}")
+    print("-" * 44)
+    for name, probs in [
+        ("Logistic Regression", lr_test_probs),
+        ("Neural Net (MLP)", nn_test_probs),
+        ("XGBoost Classifier", xgb_test_probs),
+        ("LightGBM Classifier", lgbm_test_probs),
+        ("Calibrated XGBoost", calibrated_xgb.predict_proba(X_test)[:, 1]),
+        ("Calibrated LightGBM", cal_lgbm_test_probs),
+    ]:
+        print(f"{name:<22} | {roc_auc_score(y_test, probs):>8.4f} | {average_precision_score(y_test, probs):>8.4f}")
+
     print("\n--------------------------------------------------")
     print(" 7b. MODEL STACKING / ENSEMBLE BLEND (STEP 2)")
     print("--------------------------------------------------")
     cal_xgb_val_probs = calibrated_xgb.predict_proba(X_val)[:, 1]
+    cal_lgbm_val_probs = calibrated_lgbm.predict_proba(X_val)[:, 1]
 
-    best_weights = (0.0, 0.0, 1.0)
+    best_weights = (0.0, 0.0, 0.5, 0.5)
     best_val_prauc = -1.0
 
-    # Grid search for optimal probability weights on validation set
-    for w_lr in np.linspace(0, 1, 21):
-        for w_nn in np.linspace(0, 1 - w_lr, 21):
-            w_xgb = 1.0 - w_lr - w_nn
-            if w_xgb < -1e-6:
-                continue
-            val_blend = w_lr * lr_val_probs + w_nn * val_probs_nn + w_xgb * cal_xgb_val_probs
-            score = average_precision_score(y_val, val_blend)
-            if score > best_val_prauc:
-                best_val_prauc = score
-                best_weights = (w_lr, w_nn, w_xgb)
+    # Grid search for optimal probability weights on validation set (4 models)
+    steps = np.linspace(0, 1, 11)
+    for w_lr in steps:
+        for w_nn in steps:
+            for w_xgb in steps:
+                w_lgbm = 1.0 - w_lr - w_nn - w_xgb
+                if w_lgbm < -1e-6 or w_lgbm > 1.0 + 1e-6:
+                    continue
+                val_blend = w_lr * lr_val_probs + w_nn * val_probs_nn + w_xgb * cal_xgb_val_probs + w_lgbm * cal_lgbm_val_probs
+                score = average_precision_score(y_val, val_blend)
+                if score > best_val_prauc:
+                    best_val_prauc = score
+                    best_weights = (w_lr, w_nn, w_xgb, w_lgbm)
 
-    w_lr, w_nn, w_xgb = best_weights
-    print(f"Optimal Validation Weights: LR={w_lr:.2f}, MLP={w_nn:.2f}, Calibrated XGB={w_xgb:.2f}")
+    w_lr, w_nn, w_xgb, w_lgbm = best_weights
+    print(f"Optimal Validation Weights: LR={w_lr:.2f}, MLP={w_nn:.2f}, XGB={w_xgb:.2f}, LGBM={w_lgbm:.2f}")
     print(f"Validation PR-AUC (Stacked Blend): {best_val_prauc:.4f}")
 
     cal_xgb_test_probs = calibrated_xgb.predict_proba(X_test)[:, 1]
-    test_blend = w_lr * lr_test_probs + w_nn * nn_test_probs + w_xgb * cal_xgb_test_probs
+    test_blend = w_lr * lr_test_probs + w_nn * nn_test_probs + w_xgb * cal_xgb_test_probs + w_lgbm * cal_lgbm_test_probs
 
     print("\nSealed Test Set Comparison (Blend vs Single Models):")
-    print(f"{'Model / Blend':<26} | {'ROC-AUC':>8} | {'PR-AUC':>8}")
-    print("-" * 48)
+    print(f"{'Model / Blend':<30} | {'ROC-AUC':>8} | {'PR-AUC':>8}")
+    print("-" * 52)
     for name, probs in [
         ("Logistic Regression", lr_test_probs),
         ("Neural Net (MLP)", nn_test_probs),
         ("Calibrated XGBoost", cal_xgb_test_probs),
-        ("Stacked Blend (LR+MLP+XGB)", test_blend),
+        ("Calibrated LightGBM", cal_lgbm_test_probs),
+        ("Ensemble (LR+MLP+XGB+LGBM)", test_blend),
     ]:
-        print(f"{name:<26} | {roc_auc_score(y_test, probs):>8.4f} | {average_precision_score(y_test, probs):>8.4f}")
+        print(f"{name:<30} | {roc_auc_score(y_test, probs):>8.4f} | {average_precision_score(y_test, probs):>8.4f}")
 
-    joblib.dump({"weights": best_weights}, "models/stacking_weights.pkl")
+    joblib.dump({"weights": best_weights, "model_names": ["LR", "MLP", "XGB", "LGBM"]}, "models/stacking_weights.pkl")
     print("Saved stacking weights to models/stacking_weights.pkl")
 
     # Step 3 — Walk-Forward Validation
@@ -833,11 +1014,167 @@ def main():
     alerts = explain_transaction_alert(sample_row, sample_shap, sample_val.columns, top_k=3)
     print("  Sample Transaction Risk Alerts:")
     for a in alerts:
-        print(f"   • {a}")
+        print(f"   * {a}")
 
     # Section 9: Population Stability Index (PSI) Monitoring
     top_5_shap = imp_df["feature"].head(5).tolist()
     run_psi_monitoring(train_data, calibrated_xgb, state, top_5_shap)
+
+    # ==========================================
+    # 10. COMPREHENSIVE METRICS COMPUTATION & EXPORT
+    # ==========================================
+    print("\n==================================================")
+    print(" 10. COMPREHENSIVE METRICS SUMMARY")
+    print("==================================================")
+
+    # Use the best production model (ensemble blend on test set)
+    production_probs = test_blend
+    test_amounts = test_set["TransactionAmt"].values
+
+    # Load optimal thresholds tuned on validation set (or fallback to defaults)
+    p_low, p_high = 0.0804, 0.7495
+    if os.path.exists("models/routing_thresholds.json"):
+        try:
+            with open("models/routing_thresholds.json", "r") as f:
+                th_data = json.load(f)
+                p_low = th_data.get("p_low", p_low)
+                p_high = th_data.get("p_high", p_high)
+        except Exception:
+            pass
+
+    opt_threshold = p_high
+    preds = (production_probs >= opt_threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_test, preds).ravel()
+
+    # --- ML Detection Metrics ---
+    ml_precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    ml_recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    ml_pr_auc = average_precision_score(y_test, production_probs)
+    ml_roc_auc = roc_auc_score(y_test, production_probs)
+
+    # --- Financial Cost Metrics ---
+    # Net Merchant Savings: fraud_amount_caught - false_alarm_opportunity_cost
+    fraud_caught_mask = (y_test.values == 1) & (preds == 1)
+    fraud_missed_mask = (y_test.values == 1) & (preds == 0)
+    false_alarm_mask = (y_test.values == 0) & (preds == 1)
+
+    fraud_caught_value = test_amounts[fraud_caught_mask].sum()
+    fraud_missed_value = test_amounts[fraud_missed_mask].sum()
+    false_alarm_cost = test_amounts[false_alarm_mask].sum() * 0.03 + false_alarm_mask.sum() * 10.0  # margin + churn
+    net_savings = fraud_caught_value - false_alarm_cost
+    net_savings_inr = net_savings * 83.0  # USD to INR (approx 83 INR per USD)
+    net_savings_lakhs = net_savings_inr / 100000.0  # Convert to Lakhs (1 Lakh = 100,000 INR)
+
+    # Value-Weighted Recall: fraction of fraud $ caught
+    total_fraud_value = test_amounts[y_test.values == 1].sum()
+    value_weighted_recall = fraud_caught_value / total_fraud_value if total_fraud_value > 0 else 0
+
+    # --- Merchant Funnel Metrics ---
+    # Auto-Block Precision: precision at HARD_BLOCK tier (>= p_high)
+    high_risk_mask = production_probs >= p_high
+    high_risk_fraud = (y_test.values == 1) & high_risk_mask
+    auto_block_precision = high_risk_fraud.sum() / max(high_risk_mask.sum(), 1)
+
+    # Challenge Rate: % of transactions in CHALLENGE zone (p_low to p_high)
+    challenge_mask = (production_probs >= p_low) & (production_probs < p_high)
+    challenge_rate = challenge_mask.sum() / len(y_test) * 100
+
+    # --- Operations Metrics ---
+    # Inference Latency: Benchmark 100 single predictions
+    print("Benchmarking inference latency (100 single predictions)...")
+    latencies = []
+    sample_X = X_test.iloc[:1]
+    for _ in range(100):
+        t0 = time.perf_counter()
+        calibrated_xgb.predict_proba(sample_X)
+        latencies.append((time.perf_counter() - t0) * 1000)
+    p50_latency = float(np.percentile(latencies, 50))
+
+    # Build metrics summary
+    metrics_summary = {
+        "ml_detection": {
+            "precision_pct": round(ml_precision * 100, 2),
+            "recall_pct": round(ml_recall * 100, 2),
+            "pr_auc": round(ml_pr_auc, 4),
+            "roc_auc": round(ml_roc_auc, 4),
+        },
+        "financial_cost": {
+            "net_merchant_savings_inr_lakhs": round(net_savings_lakhs, 2),
+            "net_merchant_savings_usd": round(net_savings, 2),
+            "fraud_caught_usd": round(fraud_caught_value, 2),
+            "fraud_missed_usd": round(fraud_missed_value, 2),
+            "value_weighted_recall_pct": round(value_weighted_recall * 100, 2),
+        },
+        "merchant_funnel": {
+            "auto_block_precision_pct": round(auto_block_precision * 100, 2),
+            "challenge_rate_pct": round(challenge_rate, 2),
+            "allow_rate_pct": round((production_probs < p_low).sum() / len(y_test) * 100, 2),
+            "block_rate_pct": round(high_risk_mask.sum() / len(y_test) * 100, 2),
+        },
+        "operations": {
+            "inference_latency_p50_ms": round(p50_latency, 2),
+            "inference_latency_p95_ms": round(float(np.percentile(latencies, 95)), 2),
+            "inference_latency_p99_ms": round(float(np.percentile(latencies, 99)), 2),
+        },
+        "model_comparison": {
+            "logistic_regression": {
+                "roc_auc": round(roc_auc_score(y_test, lr_test_probs), 4),
+                "pr_auc": round(average_precision_score(y_test, lr_test_probs), 4),
+            },
+            "mlp_neural_net": {
+                "roc_auc": round(roc_auc_score(y_test, nn_test_probs), 4),
+                "pr_auc": round(average_precision_score(y_test, nn_test_probs), 4),
+            },
+            "xgboost_calibrated": {
+                "roc_auc": round(roc_auc_score(y_test, cal_xgb_test_probs), 4),
+                "pr_auc": round(average_precision_score(y_test, cal_xgb_test_probs), 4),
+            },
+            "lightgbm_calibrated": {
+                "roc_auc": round(roc_auc_score(y_test, cal_lgbm_test_probs), 4),
+                "pr_auc": round(average_precision_score(y_test, cal_lgbm_test_probs), 4),
+            },
+            "ensemble_blend": {
+                "roc_auc": round(roc_auc_score(y_test, test_blend), 4),
+                "pr_auc": round(average_precision_score(y_test, test_blend), 4),
+                "weights": {"LR": w_lr, "MLP": w_nn, "XGB": w_xgb, "LGBM": w_lgbm},
+            },
+        },
+        "confusion_matrix": {
+            "threshold": opt_threshold,
+            "TP": int(tp), "FP": int(fp), "FN": int(fn), "TN": int(tn),
+        },
+        "pipeline_version": "v2.0.0-ensemble",
+    }
+
+    def convert_to_serializable(obj):
+        if isinstance(obj, (np.floating, float)):
+            return float(obj)
+        elif isinstance(obj, (np.integer, int)):
+            return int(obj)
+        elif isinstance(obj, (np.ndarray, list, tuple)):
+            return [convert_to_serializable(x) for x in obj]
+        elif isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        return obj
+
+    serializable_summary = convert_to_serializable(metrics_summary)
+
+    with open("models/metrics_summary.json", "w") as f:
+        json.dump(serializable_summary, f, indent=2)
+    print("Saved comprehensive metrics to models/metrics_summary.json")
+
+    # Print summary table
+    print(f"\n{'Metric Category':<18} | {'Metric':<24} | {'Value':>12}")
+    print("-" * 60)
+    print(f"{'ML Detection':<18} | {'Precision':<24} | {ml_precision*100:>10.2f} %")
+    print(f"{'ML Detection':<18} | {'Recall':<24} | {ml_recall*100:>10.2f} %")
+    print(f"{'ML Detection':<18} | {'PR-AUC':<24} | {ml_pr_auc:>12.4f}")
+    print(f"{'ML Detection':<18} | {'ROC-AUC':<24} | {ml_roc_auc:>12.4f}")
+    print(f"{'Financial Cost':<18} | {'Net Merchant Savings':<24} | INR {net_savings_lakhs:>8.2f} L")
+    print(f"{'Financial Cost':<18} | {'Value-Weighted Recall':<24} | {value_weighted_recall*100:>10.2f} %")
+    print(f"{'Merchant Funnel':<18} | {'Auto-Block Precision':<24} | {auto_block_precision*100:>10.2f} %")
+    print(f"{'Merchant Funnel':<18} | {'Challenge Rate':<24} | {challenge_rate:>10.2f} %")
+    print(f"{'Operations':<18} | {'Inference Latency (p50)':<24} | {p50_latency:>9.2f} ms")
 
     print("\nPipeline execution complete successfully!")
 

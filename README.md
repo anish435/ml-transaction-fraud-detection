@@ -216,7 +216,90 @@ streamlit run dashboard/app.py
 
 # 4. Batch scoring CLI (outputs fraud_probability and operational_action)
 python score_batch.py --input data/new_transactions.csv --output data/scored.csv --threshold 0.07 --check-psi
+
+# 5. Run Razorpay End-to-End Demo Simulation
+python scripts/demo_razorpay_flow.py
 ```
+
+---
+
+## 💳 SECTION 4: RAZORPAY TEST MODE INTEGRATION
+
+This project natively integrates with **Razorpay Test Mode** to score real payment gateway transactions in real-time **without altering the trained XGBoost model or feature engineering pipeline**.
+
+### 1. Feature Mismatch Handling Strategy
+
+Razorpay payment objects contain gateway-level fields (`amount`, `email`, `contact`, `card`, `created_at`), while the trained ML model requires 431 IEEE-CIS features. We bridge this gap without fabricating fake data:
+
+* **Real Overlaps Derived Live:**
+  * `TransactionAmt`: Converted from paise/cents to decimal currency (`amount / 100.0`).
+  * `hour`: Extracted from payment `created_at` timestamp in local time.
+  * `P_emaildomain`: Extracted from customer email (e.g. `user@gmail.com` $\rightarrow$ `gmail.com`).
+  * `card4` / `card6`: Extracted from `card.network` and `card.type` (`visa`, `mastercard`, `credit`, `debit`).
+* **Live Customer Velocity Engine:**
+  * A thread-safe, persistent customer velocity store (`data/customer_velocity_store.json`) tracks rolling timestamps per customer to dynamically compute:
+    * `card_time_since_last_tx` (seconds since previous transaction)
+    * `card_tx_count_1h` (1-hour attempt frequency)
+    * `card_tx_count_24h` (24-hour attempt frequency)
+* **Defaulted / Unseen Features:**
+  * Unprovided fields (`card1`, `addr1/2`, `C1-C14`, `D1-D15`, `V1-V339`) are filled using the exact cold-start fallbacks and reindex defaults already established in `transform_features()`. **No synthetic values are fabricated.**
+* **Audit Trail:**
+  * Every scored payment is immutably logged to `data/razorpay_audit_log.jsonl` with an explicit manifest of real vs defaulted features, calibrated score, operational decision, and SHAP explanation alerts.
+
+### 2. Setup & Configuration
+
+1. **Configure Environment (`.env`):**
+   Copy `.env.example` to `.env`:
+   ```bash
+   cp .env.example .env
+   ```
+   Populate your Razorpay Test API keys from [Razorpay Dashboard](https://dashboard.razorpay.com/#/app/keys):
+   ```ini
+   RAZORPAY_KEY_ID=rzp_test_YourTestKeyIdHere
+   RAZORPAY_KEY_SECRET=YourTestKeySecretHere
+   RAZORPAY_WEBHOOK_SECRET=your_test_webhook_secret_here
+   PORT=8000
+   ```
+
+2. **Start the FastAPI Microservice:**
+   ```bash
+   python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000
+   ```
+
+3. **Start the Streamlit Risk Dashboard:**
+   ```bash
+   streamlit run dashboard/app.py
+   ```
+
+### 3. End-to-End Demo Script
+
+Run the automated simulation script to create a test order, simulate payments, verify HMAC webhook signatures, and inspect fraud scoring:
+
+```bash
+python scripts/demo_razorpay_flow.py
+```
+
+**What the demo executes:**
+1. **Creates Order:** Calls `POST /create-order` via the Razorpay Python SDK.
+2. **Normal Customer Payment:** Simulates legitimate payment capture, signs webhook with HMAC SHA256, and verifies an instant **`ALLOW`** decision.
+3. **Rapid Velocity Bot Attack:** Simulates 4 rapid-fire micro-charges and sudden amount spikes for the same customer card within seconds, observing velocity counters climbing and risk escalating dynamically.
+4. **Security Check:** Sends a tampered webhook signature and verifies strict HTTP `400 Bad Request` rejection.
+5. **Audit Inspection:** Displays the latest entries logged to `data/razorpay_audit_log.jsonl`.
+
+### 4. Live External Webhook Setup (ngrok)
+
+To receive live webhooks directly from Razorpay's cloud in Test Mode:
+
+1. Expose port 8000 via ngrok:
+   ```bash
+   ngrok http 8000
+   ```
+2. In the **Razorpay Dashboard $\rightarrow$ Settings $\rightarrow$ Webhooks $\rightarrow$ Add Webhook**:
+   * **Webhook URL:** `https://<your-ngrok-subdomain>.ngrok-free.app/webhook/razorpay`
+   * **Secret:** Same value as `RAZORPAY_WEBHOOK_SECRET` in your `.env`.
+   * **Active Events:** Check `payment.captured` and `payment.authorized`.
+3. Complete a payment in Razorpay Test Mode checkout $\rightarrow$ Observe the payment scored live in the **Streamlit Dashboard $\rightarrow$ 💳 Live Razorpay Webhook Monitor** tab!
+
 
 ---
 

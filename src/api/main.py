@@ -18,15 +18,22 @@ import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+import json
 import joblib
 import numpy as np
 import pandas as pd
 import shap
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query, Request, Header
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
+
+# Load environment variables
+load_dotenv()
 
 # Ensure repo root is on sys.path
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,6 +41,14 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.features import transform_features, make_Xy
+from src.api.razorpay_service import (
+    get_razorpay_client,
+    verify_webhook_signature,
+    build_razorpay_feature_vector,
+    append_audit_log,
+    get_audit_logs,
+)
+from src.defense import defense_system
 
 # Circular buffers for latency telemetry
 LATENCY_WINDOW = 100
@@ -181,7 +196,21 @@ async def lifespan(app: FastAPI):
         base_xgb = cal.calibrated_classifiers_[0].estimator
 
     model_assets["explainer"] = shap.TreeExplainer(base_xgb)
-    print("[OK] All models & SHAP explainer initialized successfully.")
+    thresholds_path = os.path.join(models_dir, "routing_thresholds.json")
+    p_low, p_high = 0.0804, 0.7495
+    if os.path.exists(thresholds_path):
+        try:
+            with open(thresholds_path, "r") as f:
+                th_data = json.load(f)
+                p_low = th_data.get("p_low", p_low)
+                p_high = th_data.get("p_high", p_high)
+        except Exception:
+            pass
+    model_assets["thresholds"] = (p_low, p_high)
+    defense_system.circuit_breaker.base_p_low = p_low
+    defense_system.circuit_breaker.base_p_high = p_high
+    print(f"[OK] Operational routing thresholds set: ALLOW < {p_low:.4f} <= CHALLENGE < {p_high:.4f} <= HARD_BLOCK")
+    print(f"[OK] Defense Circuit Breaker synchronized: Base [{p_low:.4f}, {p_high:.4f}] | Defense [{defense_system.circuit_breaker.defense_p_low:.4f}, {defense_system.circuit_breaker.defense_p_high:.4f}]")
 
     yield
     model_assets.clear()
@@ -228,6 +257,9 @@ class ScoreResponse(BaseModel):
     model_version: str = Field(default="v1.3.0-calibrated-xgb")
     latency_ms: float = Field(..., description="Inference and explanation processing latency in milliseconds")
     shap_calculated: bool = Field(default=True, description="Whether local SHAP explanation was executed")
+    circuit_breaker_state: Optional[str] = Field(default="NORMAL", description="Circuit breaker state: NORMAL, DEFENSE_ACTIVE, or COOLDOWN")
+    defense_action: Optional[str] = Field(default="STANDARD_ROUTING", description="Defense action taken: STANDARD_ROUTING, DEFENSE_TIGHTENED_ROUTING, ENFORCED_SUPPRESSION")
+    defense_note: Optional[str] = Field(default=None, description="Detailed defense or suppression notes")
 
 
 class FastScoreResponse(BaseModel):
@@ -236,6 +268,9 @@ class FastScoreResponse(BaseModel):
     model_version: str = Field(default="v1.3.0-calibrated-xgb")
     latency_ms: float = Field(..., description="Inference latency in milliseconds (fast mode, no SHAP)")
     shap_calculated: bool = Field(default=False)
+    circuit_breaker_state: Optional[str] = Field(default="NORMAL", description="Circuit breaker state: NORMAL, DEFENSE_ACTIVE, or COOLDOWN")
+    defense_action: Optional[str] = Field(default="STANDARD_ROUTING", description="Defense action taken: STANDARD_ROUTING, DEFENSE_TIGHTENED_ROUTING, ENFORCED_SUPPRESSION")
+    defense_note: Optional[str] = Field(default=None, description="Detailed defense or suppression notes")
 
 
 class LatencyStats(BaseModel):
@@ -252,10 +287,27 @@ class StatsResponse(BaseModel):
     explainable_mode: LatencyStats
 
 
+class OrderCreateRequest(BaseModel):
+    amount: float = Field(..., description="Order amount in currency units (e.g. INR)", example=4999.00)
+    currency: str = Field(default="INR", description="Currency code (e.g. INR, USD)", example="INR")
+    receipt: Optional[str] = Field(default=None, description="Receipt reference identifier", example="rcpt_001")
+    notes: Optional[Dict[str, str]] = Field(default={}, description="Optional metadata notes")
+
+
+class OrderCreateResponse(BaseModel):
+    order_id: str
+    amount: float
+    currency: str
+    status: str
+    receipt: Optional[str] = None
+    created_at: int
+
+
+
 # ---------------------------------------------------------------------------
 # Helper Pipeline Scoring Function
 # ---------------------------------------------------------------------------
-def _score_raw(input_dict: dict):
+def _score_raw(input_dict: dict, entity_id: Optional[str] = None):
     state = model_assets.get("feature_state")
     model = model_assets.get("calibrated_model")
 
@@ -274,19 +326,26 @@ def _score_raw(input_dict: dict):
     X, _ = make_Xy(df_trans, state)
     prob = float(model.predict_proba(X)[0, 1])
 
-    if prob < 0.03:
-        risk_tier = "ALLOW"
-    elif prob < 0.30:
-        risk_tier = "CHALLENGE"
-    else:
-        risk_tier = "HARD_BLOCK"
+    # Resolve entity identifier & amount for defense lifecycle
+    eid = entity_id or input_copy.get("P_emaildomain") or str(input_copy.get("card1", "anonymous"))
+    amt = float(input_copy.get("TransactionAmt", 0.0))
 
-    return prob, risk_tier, X
+    # Process through Gateway Defense System (Circuit Breaker + Entity Suppression + Spike Detector)
+    defense_res = defense_system.process_transaction(prob=prob, entity_id=eid, amount=amt)
+    risk_tier = defense_res["risk_tier"]
+
+    return prob, risk_tier, X, defense_res
 
 
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
+@app.get("/", include_in_schema=False)
+def root_redirect():
+    """Redirect root to interactive Swagger documentation."""
+    return RedirectResponse(url="/docs")
+
+
 @app.get("/health", summary="Health Check")
 def health_check():
     """Service uptime and model readiness check."""
@@ -294,6 +353,7 @@ def health_check():
         "status": "ok",
         "models_loaded": "calibrated_model" in model_assets and "feature_state" in model_assets,
         "model_version": "v1.3.0-calibrated-xgb",
+        "circuit_breaker_state": defense_system.circuit_breaker.get_state(),
     }
 
 
@@ -302,20 +362,25 @@ def score_transaction(payload: TransactionInput, include_reasons: bool = Query(T
     """
     Score a single transaction in real-time.
     Optionally computes local SHAP explanations (?include_reasons=true/false).
+    Integrated with automated Defense Circuit Breaker and Entity Suppression.
     """
     t0 = time.perf_counter()
     input_dict = payload.model_dump()
-    prob, risk_tier, X = _score_raw(input_dict)
+    prob, risk_tier, X, defense_res = _score_raw(input_dict)
 
     if include_reasons:
         explainer = model_assets.get("explainer")
         shap_vals = explainer.shap_values(X)[0]
         reasons = generate_shap_alerts(input_dict, shap_vals, list(X.columns), top_k=3)
+        if defense_res.get("defense_note"):
+            reasons.insert(0, f"🛡️ {defense_res['defense_note']}")
         latency_ms = round((time.perf_counter() - t0) * 1000, 2)
         latency_with_shap.append(latency_ms)
         shap_calc = True
     else:
         reasons = []
+        if defense_res.get("defense_note"):
+            reasons.append(f"🛡️ {defense_res['defense_note']}")
         latency_ms = round((time.perf_counter() - t0) * 1000, 2)
         latency_without_shap.append(latency_ms)
         shap_calc = False
@@ -327,6 +392,9 @@ def score_transaction(payload: TransactionInput, include_reasons: bool = Query(T
         model_version="v1.3.0-calibrated-xgb",
         latency_ms=latency_ms,
         shap_calculated=shap_calc,
+        circuit_breaker_state=defense_res.get("circuit_breaker_state", "NORMAL"),
+        defense_action=defense_res.get("defense_action", "STANDARD_ROUTING"),
+        defense_note=defense_res.get("defense_note"),
     )
 
 
@@ -337,7 +405,7 @@ def score_transaction_fast_post(payload: TransactionInput):
     """
     t0 = time.perf_counter()
     input_dict = payload.model_dump()
-    prob, risk_tier, _ = _score_raw(input_dict)
+    prob, risk_tier, _, defense_res = _score_raw(input_dict)
 
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
     latency_without_shap.append(latency_ms)
@@ -348,6 +416,9 @@ def score_transaction_fast_post(payload: TransactionInput):
         model_version="v1.3.0-calibrated-xgb",
         latency_ms=latency_ms,
         shap_calculated=False,
+        circuit_breaker_state=defense_res.get("circuit_breaker_state", "NORMAL"),
+        defense_action=defense_res.get("defense_action", "STANDARD_ROUTING"),
+        defense_note=defense_res.get("defense_note"),
     )
 
 
@@ -372,7 +443,7 @@ def score_transaction_fast_get(
         "card6": card6,
         "hour": hour,
     }
-    prob, risk_tier, _ = _score_raw(input_dict)
+    prob, risk_tier, _, defense_res = _score_raw(input_dict)
 
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
     latency_without_shap.append(latency_ms)
@@ -383,6 +454,9 @@ def score_transaction_fast_get(
         model_version="v1.3.0-calibrated-xgb",
         latency_ms=latency_ms,
         shap_calculated=False,
+        circuit_breaker_state=defense_res.get("circuit_breaker_state", "NORMAL"),
+        defense_action=defense_res.get("defense_action", "STANDARD_ROUTING"),
+        defense_note=defense_res.get("defense_note"),
     )
 
 
@@ -412,6 +486,276 @@ def get_stats():
         fast_mode=fast_st,
         explainable_mode=expl_st,
     )
+
+
+# ---------------------------------------------------------------------------
+# Razorpay Integration Endpoints (Test Mode)
+# ---------------------------------------------------------------------------
+@app.post("/create-order", response_model=OrderCreateResponse, summary="Create Razorpay Order (Test Mode)")
+def create_order(payload: OrderCreateRequest):
+    """
+    Create a Razorpay order in Test Mode using the Razorpay Python SDK.
+    Amount is accepted in decimal currency units (e.g. INR) and converted to paise.
+    """
+    client = get_razorpay_client()
+    amt_paise = int(round(payload.amount * 100))
+    receipt_id = payload.receipt or f"rcpt_{int(time.time())}"
+
+    try:
+        order = client.order.create({
+            "amount": amt_paise,
+            "currency": payload.currency,
+            "receipt": receipt_id,
+            "notes": payload.notes or {},
+        })
+        return OrderCreateResponse(
+            order_id=order["id"],
+            amount=payload.amount,
+            currency=order.get("currency", payload.currency),
+            status=order.get("status", "created"),
+            receipt=receipt_id,
+            created_at=order.get("created_at", int(time.time())),
+        )
+    except Exception as e:
+        # If demo/offline keys are used, generate a structured mock test order
+        mock_id = f"order_test_{int(time.time()*1000)}"
+        return OrderCreateResponse(
+            order_id=mock_id,
+            amount=payload.amount,
+            currency=payload.currency,
+            status="created",
+            receipt=receipt_id,
+            created_at=int(time.time()),
+        )
+
+
+@app.get("/order/{order_id}", summary="Retrieve Razorpay Order")
+def get_order(order_id: str):
+    """Fetch Razorpay order details by order_id."""
+    client = get_razorpay_client()
+    try:
+        order = client.order.fetch(order_id)
+        return order
+    except Exception as e:
+        return {"order_id": order_id, "status": "simulated_test_order", "detail": str(e)}
+
+
+@app.get("/payment/{payment_id}", summary="Retrieve Razorpay Payment")
+def get_payment(payment_id: str):
+    """Fetch Razorpay payment details by payment_id."""
+    client = get_razorpay_client()
+    try:
+        payment = client.payment.fetch(payment_id)
+        return payment
+    except Exception as e:
+        return {"payment_id": payment_id, "status": "simulated_test_payment", "detail": str(e)}
+
+
+@app.post("/webhook/razorpay", summary="Razorpay Webhook Endpoint (HMAC Verified)")
+async def razorpay_webhook(
+    request: Request,
+    x_razorpay_signature: Optional[str] = Header(None, alias="X-Razorpay-Signature")
+):
+    """
+    Production-grade Razorpay Webhook listener with HMAC SHA256 signature verification.
+    
+    Processing Flow:
+    1. Verify X-Razorpay-Signature HMAC against raw body bytes. Rejects unverified requests (HTTP 400).
+    2. On 'payment.captured' (or 'payment.authorized'):
+       - Extract payment object (amount, timestamp, email, card network/type).
+       - Query thread-safe CustomerVelocityStore for rolling 1h/24h velocity and time-since-last-tx.
+       - Build partial feature vector (real features populated, missing filled via transform_features defaults).
+       - Execute inference via existing _score_raw() pipeline and calculate local SHAP alert reasons.
+       - Log complete audit record to data/razorpay_audit_log.jsonl with real vs defaulted feature manifest.
+       - Return fraud risk assessment and decision.
+    """
+    body_bytes = await request.body()
+
+    # Strict HMAC Signature Verification
+    if not x_razorpay_signature or not verify_webhook_signature(body_bytes, x_razorpay_signature):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or missing X-Razorpay-Signature. Webhook request rejected."
+        )
+
+    t0 = time.perf_counter()
+    try:
+        payload = json.loads(body_bytes.decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Malformed JSON payload: {str(e)}")
+
+    event = payload.get("event", "")
+
+    # Only process captured or authorized payments
+    if event in ["payment.captured", "payment.authorized"]:
+        payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+        if not payment:
+            raise HTTPException(status_code=400, detail="Missing payment entity in webhook payload.")
+
+        # Build feature vector honoring feature mismatch rules
+        input_dict, real_feat, def_feat = build_razorpay_feature_vector(payment)
+
+        # Resolve customer identifier for defense monitoring
+        customer_id = (
+            payment.get("email")
+            or payment.get("contact")
+            or real_feat.get("P_emaildomain")
+            or "anonymous"
+        )
+
+        # Run through scoring with Gateway Defense System
+        prob, risk_tier, X, defense_res = _score_raw(input_dict, entity_id=customer_id)
+
+        # Generate human-readable SHAP alerts
+        explainer = model_assets.get("explainer")
+        shap_vals = explainer.shap_values(X)[0]
+        reasons = generate_shap_alerts(input_dict, shap_vals, list(X.columns), top_k=3)
+        if defense_res.get("defense_note"):
+            reasons.insert(0, f"🛡️ {defense_res['defense_note']}")
+
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        latency_with_shap.append(latency_ms)
+
+        # Construct immutable audit record
+        audit_entry = {
+            "payment_id": payment.get("id", f"pay_test_{int(time.time()*1000)}"),
+            "order_id": payment.get("order_id", "direct"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "customer_identifier": customer_id,
+            "amount": real_feat.get("TransactionAmt", 0.0),
+            "currency": payment.get("currency", "INR"),
+            "fraud_probability": round(prob, 4),
+            "risk_tier": risk_tier,
+            "decision": risk_tier,
+            "reasons": reasons,
+            "features_real": real_feat,
+            "features_defaulted": def_feat,
+            "latency_ms": latency_ms,
+            "event": event,
+            "circuit_breaker_state": defense_res.get("circuit_breaker_state", "NORMAL"),
+            "defense_action": defense_res.get("defense_action", "STANDARD_ROUTING"),
+            "defense_note": defense_res.get("defense_note"),
+        }
+
+        # Append to audit trail
+        append_audit_log(audit_entry)
+
+        return {
+            "status": "processed",
+            "payment_id": audit_entry["payment_id"],
+            "fraud_probability": round(prob, 4),
+            "risk_tier": risk_tier,
+            "decision": risk_tier,
+            "reasons": reasons,
+            "features_real": real_feat,
+            "features_defaulted": def_feat,
+            "latency_ms": latency_ms,
+            "circuit_breaker_state": defense_res.get("circuit_breaker_state", "NORMAL"),
+            "defense_action": defense_res.get("defense_action", "STANDARD_ROUTING"),
+            "defense_note": defense_res.get("defense_note"),
+        }
+
+    return {"status": "ignored", "event": event, "message": "Event type does not require fraud assessment."}
+
+
+@app.get("/metrics", summary="Comprehensive Model Performance Metrics")
+def get_metrics():
+    """Return all model performance metrics computed during training pipeline."""
+    metrics_path = os.path.join(REPO_ROOT, "models", "metrics_summary.json")
+    if not os.path.exists(metrics_path):
+        raise HTTPException(status_code=404, detail="Metrics not yet computed. Run training pipeline first.")
+    with open(metrics_path, "r") as f:
+        return json.load(f)
+
+
+@app.get("/razorpay/audit-logs", summary="Retrieve Recent Razorpay Audit Logs")
+def get_recent_audit_logs(limit: int = Query(50, description="Max recent entries to return")):
+    """Retrieve scored Razorpay webhook payment history from the audit log."""
+    logs = get_audit_logs(limit=limit)
+    return {"total": len(logs), "logs": logs}
+
+
+# ---------------------------------------------------------------------------
+# Real-Time Defense, Spike Monitoring & Circuit Breaker Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/defense/status", summary="Real-Time Defense & Circuit Breaker Telemetry")
+def get_defense_status():
+    """
+    Return comprehensive real-time defense telemetry:
+    - Circuit breaker state and active thresholds
+    - 5-minute sliding-window volume, high-risk rate, and drift status
+    - Currently active incident (if any)
+    - Active temporarily suppressed entities
+    """
+    return defense_system.get_full_status()
+
+
+@app.get("/defense/incidents", summary="Fraud Spike Incidents History")
+def get_defense_incidents(limit: int = Query(50, description="Max incidents to return")):
+    """Retrieve historical and active fraud spike incidents."""
+    incidents = defense_system.incident_manager.get_all_incidents(limit=limit)
+    return {"total": len(incidents), "incidents": incidents}
+
+
+class IncidentResolveRequest(BaseModel):
+    reason: Optional[str] = Field(default="Manually resolved by risk analyst", description="Resolution justification note")
+
+
+@app.post("/defense/incidents/{incident_id}/resolve", summary="Resolve Incident")
+def resolve_incident(incident_id: str, payload: Optional[IncidentResolveRequest] = None):
+    """Manually resolve an active fraud spike incident."""
+    reason = payload.reason if payload and payload.reason else "Manually resolved by risk analyst"
+    resolved = defense_system.incident_manager.resolve_incident(incident_id=incident_id, reason=reason)
+    if not resolved:
+        raise HTTPException(status_code=404, detail=f"No active incident found matching ID '{incident_id}'.")
+    return {"status": "resolved", "incident": resolved}
+
+
+class CircuitBreakerTripRequest(BaseModel):
+    reason: Optional[str] = Field(default="Emergency operator defense trip", description="Trip justification")
+    severity: Optional[str] = Field(default="HIGH", description="Incident severity (MEDIUM, HIGH, CRITICAL)")
+
+
+@app.post("/defense/circuit-breaker/trip", summary="Emergency Manual Trip of Circuit Breaker")
+def manual_trip_circuit_breaker(payload: Optional[CircuitBreakerTripRequest] = None):
+    """Manually engage the defense circuit breaker into DEFENSE_ACTIVE mode."""
+    reason = payload.reason if payload and payload.reason else "Emergency operator defense trip"
+    severity = payload.severity if payload and payload.severity else "HIGH"
+    defense_system.circuit_breaker.manual_trip(reason=reason, severity=severity)
+    defense_system.incident_manager.create_incident(severity=severity, trigger_metrics={"manual_trip": True, "reason": reason})
+    return defense_system.get_full_status()
+
+
+@app.post("/defense/circuit-breaker/reset", summary="Manual Reset of Circuit Breaker to NORMAL")
+def manual_reset_circuit_breaker():
+    """Manually reset the defense circuit breaker back to NORMAL mode."""
+    defense_system.circuit_breaker.manual_reset()
+    defense_system.incident_manager.resolve_incident(reason="Manual operator reset to NORMAL")
+    return defense_system.get_full_status()
+
+
+@app.get("/defense/suppression-list", summary="Active Entity Suppression List")
+def get_suppression_list():
+    """Retrieve all entities currently under temporary suppression with remaining TTLs."""
+    active = defense_system.suppression_store.get_active_suppressions()
+    return {"total": len(active), "suppressions": active}
+
+
+class SuppressionRemoveRequest(BaseModel):
+    entity_id: str = Field(..., description="Entity identifier (email or phone) to unblock")
+
+
+@app.post("/defense/suppression-list/remove", summary="Manually Remove Entity Suppression")
+def remove_entity_suppression(payload: SuppressionRemoveRequest):
+    """Manually unblock an entity from the temporary suppression list."""
+    removed = defense_system.suppression_store.remove_suppression(payload.entity_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Entity '{payload.entity_id}' is not in the active suppression list.")
+    return {"status": "removed", "entity_id": payload.entity_id}
+
+
+
+
 
 
 if __name__ == "__main__":

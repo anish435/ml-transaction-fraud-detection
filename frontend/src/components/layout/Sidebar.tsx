@@ -121,8 +121,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
         ))}
       </div>
 
-      {/* Footer Telemetry */}
-      <div className="p-3 border-t border-dark-700/60 bg-dark-900/60">
+      {/* Footer Telemetry & Sole Developer Profile */}
+      <div className="p-3 border-t border-dark-700/60 bg-dark-900/60 space-y-2">
         <div className="bg-dark-850 rounded-lg p-3 border border-dark-700/50 space-y-2">
           <div className="flex items-center justify-between text-xs">
             <span className="text-slate-400 font-medium">Engine API</span>
@@ -146,6 +146,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span className="font-mono text-slate-300 font-medium truncate max-w-[120px]" title={modelVersion}>
               {modelVersion || "v1.3.0"}
             </span>
+          </div>
+        </div>
+
+        {/* Sole Contributor Profile Card */}
+        <div className="flex items-center gap-2.5 p-2 rounded-lg bg-dark-850/80 border border-dark-700/50">
+          <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-brand-cyan to-brand-blue flex items-center justify-center font-bold text-xs text-dark-950 font-mono shadow-sm">
+            A
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-xs font-bold text-white truncate">Anish</div>
+            <div className="text-[10px] text-slate-400 truncate">Lead Engineer &bull; @anish435</div>
           </div>
         </div>
       </div>

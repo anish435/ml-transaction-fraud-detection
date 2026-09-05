@@ -303,7 +303,8 @@ To receive live webhooks directly from Razorpay's cloud in Test Mode:
 
 ---
 
-## 📜 License & Acknowledgments
+## 👨‍💻 Author & Sole Contributor
 
-* Dataset provided by **IEEE Computational Intelligence Society (IEEE-CIS)** and **Vesta Corporation**.
-* Built by [Anish](https://github.com/anish435).
+* **Author**: [Anish](https://github.com/anish435) — 100% solo development, architecture, ML modeling, and presentation engineering.
+* **Dataset**: [IEEE-CIS Fraud Detection](https://www.kaggle.com/competitions/ieee-fraud-detection) benchmark by IEEE Computational Intelligence Society and Vesta Corporation.
+
